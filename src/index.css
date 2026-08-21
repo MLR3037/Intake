@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --company-blue: #3f425e;
+  --company-plum: #352b43;
+  --company-raisin: #211b21;
+  --company-yellow: #d9a441;
+  --company-orange: #a84b2a;
+  --company-gray: #b8b5b3;
+  --company-blue-sage: #a7c0be;
+  --company-gray-soft: #f1f1f1;
+  --company-light-purple: #beb7c8;
+  --company-orange-soft: #f8e9e3;
+  --company-yellow-soft: #fff4d6;
+  --company-blue-sage-soft: #edf3f2;
+  --company-black: #211b21;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--company-black);
+  background: #f1f1f1;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+select {
+  font: inherit;
+}
