@@ -26,6 +26,7 @@ import {
   getSharePointConfig,
   isAvailableDirectStaffRole,
   getRequiredStaffUnits,
+  INTAKE_EXTENDED_FIELDS,
   REQUIRED_STAFF_PER_CLIENT,
   RESERVED_CLIENT_SPOTS,
   STAFF_TRAINING_PERIOD_DAYS,
@@ -173,7 +174,25 @@ const INTAKE_STATUS_ORDER = [
 ];
 
 const SERVICES_OPTIONS = ['ABA', 'School Services'];
+const PROGRAM_OPTIONS = ['EI', 'Primary', 'Transition', 'Secondary'];
 const STAFFING_RATIOS = ['1:1', '2:1', '1:2'];
+const UNASSIGNED_COLUMN = 'Unassigned items';
+
+// The rest of the Intake list's schema (Title/Services/etc. are handled as core fields elsewhere),
+// grouped into the same sections as SharePoint's New Item form, for the read-only detail view.
+const INTAKE_CORE_DETAIL_FIELDS = [
+  { section: 'Client Info', label: 'Client Name', key: 'Title' },
+  { section: 'Referral Info', label: 'Service', key: 'Services' },
+  { section: 'Referral Info', label: 'Referral Source', key: 'Referral Source' },
+  { section: 'Referral Info', label: 'School District', key: 'School District' },
+  { section: 'Internal Intake', label: 'Intake Status', key: 'Intake Status' },
+  { section: 'Internal Intake', label: 'Inquiry Date', key: 'Inquiry Date', kind: 'date' },
+  { section: 'Internal Intake', label: 'Tentative Start Date', key: 'Tentative Start Date', kind: 'date' },
+  { section: 'Internal Intake', label: 'Start Date', key: 'Start Date', kind: 'date' },
+  { section: 'Internal Intake', label: 'Staffing Ratio', key: 'Staffing Ratio' }
+];
+const INTAKE_DETAIL_FIELDS = [...INTAKE_CORE_DETAIL_FIELDS, ...INTAKE_EXTENDED_FIELDS];
+const INTAKE_DETAIL_SECTIONS = Array.from(new Set(INTAKE_DETAIL_FIELDS.map((field) => field.section)));
 const AVAILABILITY_FIELDS = ['MonAM', 'MonPM', 'TueAM', 'TuePM', 'WedAM', 'WedPM', 'ThuAM', 'ThuPM', 'FriAM', 'FriPM'];
 const WEEKDAYS = [
   { key: 'Mon', label: 'Monday' },
@@ -223,6 +242,7 @@ function normalizeIntakeStatus(value) {
 }
 
 function matchesServiceAndRatio(item, filters) {
+  if (filters.programs?.length > 0 && !filters.programs.includes(item.Program)) return false;
   if (filters.service && item.Services !== filters.service) return false;
   if (filters.staffingRatio && item['Staffing Ratio'] !== filters.staffingRatio) return false;
   return true;
@@ -250,6 +270,7 @@ export default function IntakeCapacityPlanner() {
   const [staffingSnapshot, setStaffingSnapshot] = useState(() => summarizeStaffing(MOCK_STAFF));
   const [prospectiveStaff, setProspectiveStaff] = useState([]);
   const [capacityPlanning, setCapacityPlanning] = useState([]);
+  const [boardColumns, setBoardColumns] = useState([]);
   const [syncLoading, setSyncLoading] = useState(false);
   const [syncConnected, setSyncConnected] = useState(false);
   const [syncError, setSyncError] = useState('');
@@ -261,12 +282,22 @@ export default function IntakeCapacityPlanner() {
   const [whatIfStaffDelta, setWhatIfStaffDelta] = useState(0);
   const [whatIfClientDelta, setWhatIfClientDelta] = useState(0);
   const [filters, setFilters] = useState({
+    programs: [],
     service: null,
     staffingRatio: null,
     intakeStatus: null,
+    staffPosition: null,
+    staffSource: null,
+    staffStatus: null,
     showProspectsOnly: true
   });
   const [expandedRow, setExpandedRow] = useState(null);
+  const [staffSort, setStaffSort] = useState({ field: 'name', direction: 'asc' });
+  const [showIntakeForm, setShowIntakeForm] = useState(false);
+  const [editingIntakeItem, setEditingIntakeItem] = useState(null);
+  const [selectedIntakeItem, setSelectedIntakeItem] = useState(null);
+  const [intakeFormError, setIntakeFormError] = useState('');
+  const [intakeFormSaving, setIntakeFormSaving] = useState(false);
   const [sharePointConfig] = useState(() => getSharePointConfig());
   const [sharePointService] = useState(() => new SharePointDataService(sharePointConfig));
 
@@ -317,6 +348,7 @@ export default function IntakeCapacityPlanner() {
       setIntakeData(snapshot.intakeClients);
       setProspectiveStaff(snapshot.prospectiveStaff || []);
       setCapacityPlanning(snapshot.capacityPlanning || []);
+      setBoardColumns(snapshot.intakeBoardColumns || []);
       setSyncConnected(true);
       setLastSyncedAt(snapshot.lastUpdatedAt);
     } catch (error) {
@@ -329,8 +361,85 @@ export default function IntakeCapacityPlanner() {
     }
   };
 
+  const handleCreateIntake = async (formValues) => {
+    setIntakeFormError('');
+    setIntakeFormSaving(true);
+    try {
+      if (editingIntakeItem) {
+        await sharePointService.updateIntakeClient(editingIntakeItem.id, formValues);
+        setIntakeData((rows) =>
+          rows.map((row) =>
+            row.id === editingIntakeItem.id
+              ? {
+                  ...row,
+                  ...formValues,
+                  'Board Choice': formValues['Intake Status'] || '',
+                  Program: formValues['DT Program'] || row.Program
+                }
+              : row
+          )
+        );
+      } else {
+        const newIntakeClient = await sharePointService.createIntakeClient(formValues);
+        setIntakeData((rows) => [...rows, newIntakeClient]);
+      }
+      setShowIntakeForm(false);
+      setEditingIntakeItem(null);
+    } catch (error) {
+      console.error('Failed to save intake record:', error);
+      setIntakeFormError(error.message || 'Failed to save intake record');
+    } finally {
+      setIntakeFormSaving(false);
+    }
+  };
+
+  const handleBoardCardDrop = async (itemId, targetColumn) => {
+    if (!syncConnected) return;
+    const item = intakeData.find((row) => String(row.id) === String(itemId));
+    if (!item) return;
+
+    const targetValue = targetColumn === UNASSIGNED_COLUMN ? '' : targetColumn;
+    const previousBoardChoice = item['Board Choice'] || '';
+    if (previousBoardChoice === targetValue) return;
+
+    const previousIntakeStatus = item['Intake Status'];
+    setIntakeData((rows) =>
+      rows.map((row) =>
+        String(row.id) === String(itemId)
+          ? { ...row, 'Board Choice': targetValue, 'Intake Status': targetValue || 'Initial Inquiry' }
+          : row
+      )
+    );
+
+    try {
+      await sharePointService.updateListItem(sharePointConfig.intakeSiteUrl, sharePointConfig.intakeListName, item.id, {
+        board_x0020_choice: targetValue
+      });
+    } catch (error) {
+      console.error('Failed to move intake card:', error);
+      setSyncError(error.message || 'Failed to move intake card');
+      // Revert the optimistic update since the SharePoint write failed.
+      setIntakeData((rows) =>
+        rows.map((row) =>
+          String(row.id) === String(itemId)
+            ? { ...row, 'Board Choice': previousBoardChoice, 'Intake Status': previousIntakeStatus }
+            : row
+        )
+      );
+    }
+  };
+
   const filteredIntakeData = intakeData.filter((item) => matchesFilters(item, filters));
   const filteredCurrentClients = currentClients.filter((item) => matchesServiceAndRatio(item, filters));
+  // Recomputed from the raw staff roster so every staff-derived stat (dashboard, projections,
+  // availability, staff table) respects the Program filter without threading it through each one.
+  const filteredStaffingSnapshot = filters.programs.length > 0
+    ? summarizeStaffing(staffingSnapshot.staff.filter((person) => filters.programs.includes(person.program)))
+    : staffingSnapshot;
+  // Same idea as filteredStaffingSnapshot, but for new hires still in the HR onboarding/training pipeline.
+  const filteredProspectiveStaff = filters.programs.length > 0
+    ? prospectiveStaff.filter((person) => filters.programs.includes(person.program))
+    : prospectiveStaff;
   const sortedIntakeData = alphabetizeNames(filteredIntakeData);
   const sortedCurrentClients = alphabetizeNames(filteredCurrentClients);
 
@@ -338,6 +447,22 @@ export default function IntakeCapacityPlanner() {
     status,
     count: filteredIntakeData.filter((item) => normalizeIntakeStatus(item['Intake Status']) === status).length
   }));
+
+  // Falls back to whatever board values already appear in the data if the live Choices lookup
+  // came back empty (e.g. still on the local mock snapshot).
+  const boardColumnNames = boardColumns.length > 0
+    ? boardColumns
+    : Array.from(new Set(intakeData.map((item) => item['Board Choice']).filter(Boolean)));
+  // Unassigned items get their own block above the board, so the scrollable row starts with the first real stage.
+  const boardColumnList = [UNASSIGNED_COLUMN, ...boardColumnNames];
+  const boardColumnData = boardColumnList.map((column) => ({
+    column,
+    items: alphabetizeNames(
+      filteredIntakeData.filter((item) => (item['Board Choice'] || '') === (column === UNASSIGNED_COLUMN ? '' : column))
+    )
+  }));
+  const unassignedBoardColumn = boardColumnData.find(({ column }) => column === UNASSIGNED_COLUMN);
+  const stageBoardColumns = boardColumnData.filter(({ column }) => column !== UNASSIGNED_COLUMN);
 
   const now = asCalendarDate(new Date());
   const availabilityProjectionDate = new Date(now);
@@ -348,12 +473,28 @@ export default function IntakeCapacityPlanner() {
     liveDate.setDate(liveDate.getDate() + STAFF_TRAINING_PERIOD_DAYS);
     return liveDate <= availabilityProjectionDate;
   };
-  const projectedAvailabilityStaff = staffingSnapshot.activeCount + prospectiveStaff.filter(
+  // Roster staff (unlike prospects) may have no recorded Start Date at all - treat that as
+  // already-established rather than excluding them, but still drop off once their End Date passes.
+  const isRosterStaffLiveByDate = (person) => {
+    if (!person.startDate) return true;
+    const liveDate = new Date(person.startDate);
+    liveDate.setDate(liveDate.getDate() + STAFF_TRAINING_PERIOD_DAYS);
+    return liveDate <= availabilityProjectionDate;
+  };
+  const isRosterStaffDischargedByDate = (person) => Boolean(person.endDate) && new Date(person.endDate) < availabilityProjectionDate;
+  const projectedRosterStaff = filteredStaffingSnapshot.staff.filter(
+    (person) =>
+      person.isActive !== false &&
+      isAvailableDirectStaffRole(person.role) &&
+      isRosterStaffLiveByDate(person) &&
+      !isRosterStaffDischargedByDate(person)
+  ).length;
+  const projectedAvailabilityStaff = projectedRosterStaff + filteredProspectiveStaff.filter(
     (person) =>
       isAvailableDirectStaffRole(person.position) &&
       isLiveByAvailabilityDate(person)
   ).length;
-  const projectedAvailabilityTraining = prospectiveStaff.filter(
+  const projectedAvailabilityTraining = filteredProspectiveStaff.filter(
     (person) =>
       isAvailableDirectStaffRole(person.position) &&
       person.startDate &&
@@ -418,10 +559,10 @@ export default function IntakeCapacityPlanner() {
     generateCapacityProjection(
       filteredCurrentClients,
       filteredIntakeData,
-      staffingSnapshot.activeCount,
-      prospectiveStaff,
+      filteredStaffingSnapshot.activeCount,
+      filteredProspectiveStaff,
       projectionWeeks,
-      staffingSnapshot.staff,
+      filteredStaffingSnapshot.staff,
       historyWeeks
     ),
     { staffDelta: whatIfStaffDelta, clientDelta: whatIfClientDelta }
@@ -442,7 +583,7 @@ export default function IntakeCapacityPlanner() {
   const historicalProjectionWeeks = projectionChartData.filter((week) => week.isHistorical);
   const currentProjectionWeek = projectionChartData.find((week) => !week.isHistorical);
 
-  const upcomingStaffEndDates = staffingSnapshot.staff
+  const upcomingStaffEndDates = filteredStaffingSnapshot.staff
     .filter((person) => person.endDate)
     .map((person) => ({
       ...person,
@@ -453,7 +594,13 @@ export default function IntakeCapacityPlanner() {
 
   const planningRows = alphabetizeNames([
     ...currentClients
-      .filter((client) => client['Start Date'] || client['Tentative Start Date'])
+      .filter((client) => {
+        if (!(client['Start Date'] || client['Tentative Start Date'])) return false;
+        if (filters.programs.length > 0 && !filters.programs.includes(client.Program)) return false;
+        // Exclude clients who will already be discharged by the selected projection date, not just today.
+        const dischargeDate = client['Discharge Date'] ? asCalendarDate(client['Discharge Date']) : null;
+        return !dischargeDate || dischargeDate >= availabilityProjectionDate;
+      })
       .map((client) => ({
       id: `client-${client.id}`,
       sourceList: 'Clients',
@@ -461,10 +608,15 @@ export default function IntakeCapacityPlanner() {
       personType: 'Client',
       name: client.Title,
       position: client.Services,
+      'Staffing Ratio': client['Staffing Ratio'],
       isUpcoming: false
       })),
     ...intakeData
-      .filter((client) => client['Start Date'] || client['Tentative Start Date'])
+      .filter((client) =>
+        (client['Start Date'] || client['Tentative Start Date']) &&
+        normalizeIntakeStatus(client['Intake Status']) !== 'On Hold' &&
+        (filters.programs.length === 0 || filters.programs.includes(client.Program))
+      )
       .map((client) => ({
       id: `intake-${client.id}`,
       sourceList: 'Intake',
@@ -472,6 +624,7 @@ export default function IntakeCapacityPlanner() {
       personType: 'Client',
       name: client.Title,
       position: client.Services,
+      'Staffing Ratio': client['Staffing Ratio'],
       isUpcoming: true
       }))
   ].map((person) => ({
@@ -587,11 +740,11 @@ export default function IntakeCapacityPlanner() {
     currentCapacity: filteredCurrentClients.length,
     totalClients: filteredCurrentClients.length + filteredIntakeData.length,
     averageStaffingRatio: calculateAverageRatio([...filteredIntakeData, ...filteredCurrentClients]),
-    activeStaff: staffingSnapshot.activeCount
+    activeStaff: filteredStaffingSnapshot.activeCount
   };
 
-  const staffRows = alphabetizeNames([
-    ...staffingSnapshot.staff.map((person) => ({
+  const unsortedStaffRows = [
+    ...filteredStaffingSnapshot.staff.map((person) => ({
       id: `current-${person.id}`,
       name: person.name,
       position: person.role,
@@ -600,7 +753,7 @@ export default function IntakeCapacityPlanner() {
       startDate: person.startDate,
       endDate: person.endDate
     })),
-    ...prospectiveStaff.map((person) => ({
+    ...filteredProspectiveStaff.map((person) => ({
       id: `upcoming-${person.id}`,
       name: person.name,
       position: person.position,
@@ -609,7 +762,37 @@ export default function IntakeCapacityPlanner() {
       startDate: person.startDate,
       endDate: person.endDate || null
     }))
-  ]);
+  ];
+
+  const staffPositionOptions = Array.from(new Set(unsortedStaffRows.map((person) => person.position).filter(Boolean))).sort();
+  const staffSourceOptions = Array.from(new Set(unsortedStaffRows.map((person) => person.source).filter(Boolean))).sort();
+  const staffStatusOptions = Array.from(new Set(unsortedStaffRows.map((person) => person.status).filter(Boolean))).sort();
+
+  const filteredStaffRows = unsortedStaffRows.filter((person) => {
+    if (filters.staffPosition && person.position !== filters.staffPosition) return false;
+    if (filters.staffSource && person.source !== filters.staffSource) return false;
+    if (filters.staffStatus && person.status !== filters.staffStatus) return false;
+    return true;
+  });
+
+  const staffRows = staffSort.field === 'startDate'
+    ? [...filteredStaffRows].sort((left, right) => {
+        const leftTime = left.startDate ? new Date(left.startDate).getTime() : null;
+        const rightTime = right.startDate ? new Date(right.startDate).getTime() : null;
+        if (leftTime === null && rightTime === null) return 0;
+        if (leftTime === null) return 1;
+        if (rightTime === null) return -1;
+        return staffSort.direction === 'asc' ? leftTime - rightTime : rightTime - leftTime;
+      })
+    : alphabetizeNames(filteredStaffRows);
+
+  const toggleStaffSort = (field) => {
+    setStaffSort((current) =>
+      current.field === field
+        ? { field, direction: current.direction === 'asc' ? 'desc' : 'asc' }
+        : { field, direction: 'asc' }
+    );
+  };
 
   return (
     <div className="min-h-screen bg-[#f1f1f1]">
@@ -630,6 +813,14 @@ export default function IntakeCapacityPlanner() {
                 {syncLoading ? 'Syncing...' : syncConnected ? 'Refresh SharePoint Data' : 'Connect SharePoint'}
               </button>
               <button
+                onClick={() => setShowIntakeForm(true)}
+                disabled={!syncConnected}
+                title={syncConnected ? '' : 'Connect SharePoint before adding an intake record'}
+                className="flex items-center gap-2 rounded-lg bg-[#a7c0be] px-4 py-2 font-semibold text-[#211b21] transition-colors hover:bg-[#8fb0ad] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Add Intake
+              </button>
+              <button
                 onClick={() => exportIntakeDataToCSV(filteredIntakeData)}
                 className="flex items-center gap-2 rounded-lg bg-[#352b43] px-4 py-2 font-semibold text-white transition-colors hover:bg-[#211b21] focus:outline-none focus:ring-2 focus:ring-[#d9a441]"
               >
@@ -643,6 +834,7 @@ export default function IntakeCapacityPlanner() {
               >
                 <option value="dashboard">Dashboard</option>
                 <option value="details">Prospective Clients</option>
+                <option value="board">Intake Board</option>
                 <option value="currentClients">Current Clients</option>
                 <option value="staff">Staff</option>
                 <option value="availability">Availability Planning</option>
@@ -675,30 +867,65 @@ export default function IntakeCapacityPlanner() {
             <h3 className="font-semibold text-slate-900">Filters</h3>
           </div>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-            <FilterSelect
-              label="Service"
-              options={SERVICES_OPTIONS}
-              value={filters.service}
-              onChange={(value) => setFilters({ ...filters, service: value })}
+            <MultiSelectFilter
+              label="Program"
+              options={PROGRAM_OPTIONS}
+              values={filters.programs}
+              onChange={(values) => setFilters({ ...filters, programs: values })}
             />
-            <FilterSelect
-              label="Staffing Ratio"
-              options={STAFFING_RATIOS}
-              value={filters.staffingRatio}
-              onChange={(value) => setFilters({ ...filters, staffingRatio: value })}
-            />
-            <FilterSelect
-              label="Intake Status"
-              options={INTAKE_STATUS_ORDER}
-              value={filters.intakeStatus}
-              onChange={(value) => setFilters({ ...filters, intakeStatus: value })}
-            />
+            {view === 'staff' ? (
+              <>
+                <FilterSelect
+                  label="Position"
+                  options={staffPositionOptions}
+                  value={filters.staffPosition}
+                  onChange={(value) => setFilters({ ...filters, staffPosition: value })}
+                />
+                <FilterSelect
+                  label="Source"
+                  options={staffSourceOptions}
+                  value={filters.staffSource}
+                  onChange={(value) => setFilters({ ...filters, staffSource: value })}
+                />
+                <FilterSelect
+                  label="Status"
+                  options={staffStatusOptions}
+                  value={filters.staffStatus}
+                  onChange={(value) => setFilters({ ...filters, staffStatus: value })}
+                />
+              </>
+            ) : (
+              <>
+                <FilterSelect
+                  label="Service"
+                  options={SERVICES_OPTIONS}
+                  value={filters.service}
+                  onChange={(value) => setFilters({ ...filters, service: value })}
+                />
+                <FilterSelect
+                  label="Staffing Ratio"
+                  options={STAFFING_RATIOS}
+                  value={filters.staffingRatio}
+                  onChange={(value) => setFilters({ ...filters, staffingRatio: value })}
+                />
+                <FilterSelect
+                  label="Intake Status"
+                  options={INTAKE_STATUS_ORDER}
+                  value={filters.intakeStatus}
+                  onChange={(value) => setFilters({ ...filters, intakeStatus: value })}
+                />
+              </>
+            )}
             <button
               onClick={() =>
                 setFilters({
+                  programs: [],
                   service: null,
                   staffingRatio: null,
                   intakeStatus: null,
+                  staffPosition: null,
+                  staffSource: null,
+                  staffStatus: null,
                   showProspectsOnly: true
                 })
               }
@@ -926,6 +1153,41 @@ export default function IntakeCapacityPlanner() {
           </div>
         )}
 
+        {view === 'board' && (
+          <div className="space-y-6">
+            {!syncConnected && (
+              <p className="text-sm text-slate-500">Connect SharePoint to drag cards between columns.</p>
+            )}
+
+            {unassignedBoardColumn && (
+              <BoardColumn
+                column={unassignedBoardColumn.column}
+                items={unassignedBoardColumn.items}
+                syncConnected={syncConnected}
+                onDrop={handleBoardCardDrop}
+                onSelect={setSelectedIntakeItem}
+                className="w-full"
+              />
+            )}
+
+            <div className="overflow-x-auto pb-4">
+              <div className="flex gap-4" style={{ minWidth: `${stageBoardColumns.length * 280}px` }}>
+                {stageBoardColumns.map(({ column, items }) => (
+                  <BoardColumn
+                    key={column}
+                    column={column}
+                    items={items}
+                    syncConnected={syncConnected}
+                    onDrop={handleBoardCardDrop}
+                    onSelect={setSelectedIntakeItem}
+                    className="w-64 flex-shrink-0"
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
         {view === 'currentClients' && (
           <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
             <div className="overflow-x-auto">
@@ -965,11 +1227,21 @@ export default function IntakeCapacityPlanner() {
               <table className="w-full">
                 <thead className="border-b border-slate-200 bg-slate-50">
                   <tr>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Staff Member</th>
+                    <th
+                      className="cursor-pointer select-none px-6 py-3 text-left text-xs font-semibold text-slate-700"
+                      onClick={() => toggleStaffSort('name')}
+                    >
+                      Staff Member{staffSort.field === 'name' ? (staffSort.direction === 'asc' ? ' ▲' : ' ▼') : ''}
+                    </th>
                     <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Position</th>
                     <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Source</th>
                     <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Status</th>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Start Date</th>
+                    <th
+                      className="cursor-pointer select-none px-6 py-3 text-left text-xs font-semibold text-slate-700"
+                      onClick={() => toggleStaffSort('startDate')}
+                    >
+                      Start Date{staffSort.field === 'startDate' ? (staffSort.direction === 'asc' ? ' ▲' : ' ▼') : ''}
+                    </th>
                     <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">End Date</th>
                   </tr>
                 </thead>
@@ -1373,10 +1645,10 @@ export default function IntakeCapacityPlanner() {
               <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
                 <h3 className="mb-4 text-lg font-bold text-slate-900">Upcoming Staff</h3>
                 <div className="space-y-2">
-                  {prospectiveStaff.length === 0 ? (
+                  {filteredProspectiveStaff.length === 0 ? (
                     <p className="text-sm text-slate-500">No upcoming staff found.</p>
                   ) : (
-                    prospectiveStaff
+                    filteredProspectiveStaff
                       .filter((person) => person.startDate)
                       .map((person) => ({
                         person,
@@ -1423,6 +1695,35 @@ export default function IntakeCapacityPlanner() {
           </div>
         )}
       </main>
+
+      {showIntakeForm && (
+        <IntakeFormModal
+          saving={intakeFormSaving}
+          error={intakeFormError}
+          editingItem={editingIntakeItem}
+          onCancel={() => {
+            setShowIntakeForm(false);
+            setEditingIntakeItem(null);
+          }}
+          onSubmit={handleCreateIntake}
+        />
+      )}
+
+      {selectedIntakeItem && (
+        <IntakeDetailModal
+          item={selectedIntakeItem}
+          onClose={() => setSelectedIntakeItem(null)}
+          onEdit={
+            syncConnected
+              ? () => {
+                  setEditingIntakeItem(selectedIntakeItem);
+                  setSelectedIntakeItem(null);
+                  setShowIntakeForm(true);
+                }
+              : null
+          }
+        />
+      )}
     </div>
   );
 }
@@ -1495,6 +1796,300 @@ function StatCard({ title, value, subtitle, color }) {
   );
 }
 
+function BoardColumn({ column, items, syncConnected, onDrop, onSelect, className }) {
+  const cardFields = [
+    { key: 'Title', label: 'Client' },
+    { key: 'Inquiry Date', label: 'Inquiry Date', kind: 'date' },
+    { key: 'DT Program', label: 'DT Program' },
+    { key: 'Services', label: 'Services' },
+    { key: 'RMHS Elig', label: 'RMHS Elig' },
+    { key: 'Admission Order', label: 'Admission Order' },
+    { key: 'School District', label: 'School District' }
+  ];
+
+  return (
+    <div
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        const itemId = event.dataTransfer.getData('text/plain');
+        onDrop(itemId, column);
+      }}
+      className={`rounded-lg bg-slate-100 p-3 ${className}`}
+    >
+      <h3 className="mb-3 flex items-center justify-between text-sm font-semibold text-slate-700">
+        <span>{column}</span>
+        <span className="text-xs font-normal text-slate-500">({items.length})</span>
+      </h3>
+      <div className="space-y-2">
+        {items.map((item) => (
+          <div
+            key={item.id}
+            draggable={syncConnected}
+            onDragStart={(event) => event.dataTransfer.setData('text/plain', String(item.id))}
+            onClick={() => onSelect(item)}
+            className={`cursor-pointer rounded-lg border border-slate-200 bg-white p-3 shadow-sm hover:border-[#3f425e] ${syncConnected ? 'active:cursor-grabbing' : ''}`}
+          >
+            {cardFields.map(({ key, label, kind }, index) => (
+              <React.Fragment key={key}>
+                <p className={`text-xs text-slate-500 ${index === 0 ? 'font-medium uppercase tracking-wide' : ''}`}>{label}</p>
+                <p className={`${index < cardFields.length - 1 ? 'mb-2' : ''} ${index === 0 ? 'text-sm font-semibold text-slate-900' : 'text-sm text-slate-700'}`}>
+                  {(kind === 'date' ? formatDate(item[key]) : item[key]) || 'N/A'}
+                </p>
+              </React.Fragment>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function IntakeDetailModal({ item, onClose, onEdit }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="max-h-[85vh] w-full max-w-3xl overflow-y-auto rounded-lg bg-white p-6 shadow-xl">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-xl font-bold text-slate-900">{item.Title}</h2>
+          <div className="flex items-center gap-3">
+            {onEdit && (
+              <button
+                onClick={onEdit}
+                className="rounded-lg bg-[#352b43] px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-[#211b21]"
+              >
+                Edit
+              </button>
+            )}
+            <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
+              <ChevronDown size={20} className="rotate-90" />
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-6">
+          {INTAKE_DETAIL_SECTIONS.map((section) => {
+            const fields = INTAKE_DETAIL_FIELDS.filter((field) => field.section === section);
+            return (
+              <div key={section}>
+                <h3 className="mb-2 border-b border-slate-200 pb-1 text-sm font-bold uppercase tracking-wide text-slate-500">
+                  {section}
+                </h3>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {fields.map((field) => (
+                    <DetailField
+                      key={field.key}
+                      label={field.label}
+                      value={(field.kind === 'date' ? formatDate(item[field.key]) : item[field.key]) || 'N/A'}
+                    />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function toDateInputValue(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString().slice(0, 10);
+}
+
+function IntakeFormModal({ saving, error, editingItem, onCancel, onSubmit }) {
+  const [values, setValues] = useState(() => {
+    const initial = editingItem
+      ? {
+          Title: editingItem.Title || '',
+          Services: editingItem.Services || SERVICES_OPTIONS[0],
+          'Referral Source': editingItem['Referral Source'] || '',
+          'School District': editingItem['School District'] || '',
+          'Inquiry Date': toDateInputValue(editingItem['Inquiry Date']),
+          'Tentative Start Date': toDateInputValue(editingItem['Tentative Start Date']),
+          'Staffing Ratio': editingItem['Staffing Ratio'] || STAFFING_RATIOS[0],
+          'Intake Status': editingItem['Intake Status'] || INTAKE_STATUS_ORDER[0]
+        }
+      : {
+          Title: '',
+          Services: SERVICES_OPTIONS[0],
+          'Referral Source': '',
+          'School District': '',
+          'Inquiry Date': new Date().toISOString().slice(0, 10),
+          'Tentative Start Date': '',
+          'Staffing Ratio': STAFFING_RATIOS[0],
+          'Intake Status': INTAKE_STATUS_ORDER[0]
+        };
+    // Person fields (BCBA, Teacher, Reviewer, etc.) aren't writable from a plain text input,
+    // since SharePoint needs a resolved user ID - they're read-only until assigned in SharePoint.
+    INTAKE_EXTENDED_FIELDS.filter((field) => field.kind !== 'person').forEach((field) => {
+      const existing = editingItem?.[field.key];
+      initial[field.key] = field.kind === 'date' ? toDateInputValue(existing) : existing || '';
+    });
+    return initial;
+  });
+
+  const setField = (field, value) => setValues((current) => ({ ...current, [field]: value }));
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    if (!values.Title.trim()) return;
+    onSubmit(values);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="max-h-[85vh] w-full max-w-2xl overflow-y-auto rounded-lg bg-white p-6 shadow-xl">
+        <h2 className="mb-4 text-xl font-bold text-slate-900">{editingItem ? 'Edit Intake Record' : 'Add Intake Record'}</h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700">Client Name</label>
+            <input
+              type="text"
+              required
+              value={values.Title}
+              onChange={(event) => setField('Title', event.target.value)}
+              className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Service</label>
+              <select
+                value={values.Services}
+                onChange={(event) => setField('Services', event.target.value)}
+                className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+              >
+                {SERVICES_OPTIONS.map((option) => (
+                  <option key={option} value={option}>{option}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Staffing Ratio</label>
+              <select
+                value={values['Staffing Ratio']}
+                onChange={(event) => setField('Staffing Ratio', event.target.value)}
+                className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+              >
+                {STAFFING_RATIOS.map((option) => (
+                  <option key={option} value={option}>{option}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700">Intake Status</label>
+            <select
+              value={values['Intake Status']}
+              onChange={(event) => setField('Intake Status', event.target.value)}
+              className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+            >
+              {INTAKE_STATUS_ORDER.map((option) => (
+                <option key={option} value={option}>{option}</option>
+              ))}
+            </select>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Referral Source</label>
+              <input
+                type="text"
+                value={values['Referral Source']}
+                onChange={(event) => setField('Referral Source', event.target.value)}
+                className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">School District</label>
+              <input
+                type="text"
+                value={values['School District']}
+                onChange={(event) => setField('School District', event.target.value)}
+                className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Inquiry Date</label>
+              <input
+                type="date"
+                value={values['Inquiry Date']}
+                onChange={(event) => setField('Inquiry Date', event.target.value)}
+                className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Tentative Start Date</label>
+              <input
+                type="date"
+                value={values['Tentative Start Date']}
+                onChange={(event) => setField('Tentative Start Date', event.target.value)}
+                className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+              />
+            </div>
+          </div>
+
+          {INTAKE_DETAIL_SECTIONS.map((section) => {
+            const fields = INTAKE_EXTENDED_FIELDS.filter((field) => field.section === section && field.kind !== 'person');
+            if (fields.length === 0) return null;
+            return (
+              <div key={section}>
+                <h3 className="mb-2 border-b border-slate-200 pb-1 text-sm font-bold uppercase tracking-wide text-slate-500">
+                  {section}
+                </h3>
+                <div className="grid grid-cols-2 gap-4">
+                  {fields.map((field) => (
+                    <div key={field.key} className={field.kind === 'textarea' ? 'col-span-2' : ''}>
+                      <label className="mb-1 block text-sm font-medium text-slate-700">{field.label}</label>
+                      {field.kind === 'textarea' ? (
+                        <textarea
+                          value={values[field.key]}
+                          onChange={(event) => setField(field.key, event.target.value)}
+                          className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+                        />
+                      ) : (
+                        <input
+                          type={field.kind === 'date' ? 'date' : 'text'}
+                          value={values[field.key]}
+                          onChange={(event) => setField(field.key, event.target.value)}
+                          className="w-full rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+
+          {error && <p className="text-sm text-[#a84b2a]">{error}</p>}
+
+          <div className="flex justify-end gap-3 pt-2">
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={saving}
+              className="rounded-lg bg-slate-100 px-4 py-2 font-medium text-slate-700 transition-colors hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={saving}
+              className="rounded-lg bg-[#352b43] px-4 py-2 font-semibold text-white transition-colors hover:bg-[#211b21] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {saving ? 'Saving...' : editingItem ? 'Save Changes' : 'Save Intake'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function FilterSelect({ label, options, value, onChange }) {
   return (
     <div>
@@ -1511,6 +2106,49 @@ function FilterSelect({ label, options, value, onChange }) {
           </option>
         ))}
       </select>
+    </div>
+  );
+}
+
+function MultiSelectFilter({ label, options, values, onChange }) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const handleOutsideClick = (event) => {
+      if (containerRef.current && !containerRef.current.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [open]);
+
+  const toggleValue = (option) => {
+    onChange(values.includes(option) ? values.filter((value) => value !== option) : [...values, option]);
+  };
+
+  const summary = values.length === 0 ? `All ${label}s` : values.join(', ');
+
+  return (
+    <div ref={containerRef} className="relative">
+      <label className="mb-2 block text-sm font-medium text-slate-700">{label}</label>
+      <button
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        className="w-full truncate rounded-lg border border-[#b8b5b3] bg-white px-3 py-2 text-left text-slate-900 hover:border-[#3f425e] focus:outline-none focus:ring-2 focus:ring-[#352b43]"
+      >
+        {summary}
+      </button>
+      {open && (
+        <div className="absolute z-20 mt-1 w-full rounded-lg border border-[#b8b5b3] bg-white p-2 shadow-lg">
+          {options.map((option) => (
+            <label key={option} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm text-slate-700 hover:bg-slate-50">
+              <input type="checkbox" checked={values.includes(option)} onChange={() => toggleValue(option)} />
+              {option}
+            </label>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

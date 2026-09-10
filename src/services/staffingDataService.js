@@ -1,29 +1,32 @@
 import { PublicClientApplication } from '@azure/msal-browser';
 
+// All SharePoint site/list identifiers must come from environment variables (see .env.local /
+// .env.example) - no organization-specific URLs or list names are hardcoded here so the source
+// stays safe to publish publicly.
 export function getSharePointConfig() {
   const env = import.meta.env;
   const fallbackRedirect = window.location.origin;
-  const siteUrl = env.VITE_SP_SITE_URL || 'https://evokebehavioralhealthcom.sharepoint.com/sites/Clinistrators';
-  const hrSiteUrl = env.VITE_SP_HR_SITE_URL || 'https://evokebehavioralhealthcom.sharepoint.com/sites/HR';
+  const siteUrl = env.VITE_SP_SITE_URL || '';
+  const hrSiteUrl = env.VITE_SP_HR_SITE_URL || '';
 
   return {
     siteUrl,
     staffSiteUrl: env.VITE_SP_STAFF_SITE_URL || hrSiteUrl,
-    staffListName: env.VITE_SP_STAFF_LIST || 'Current Employees',
+    staffListName: env.VITE_SP_STAFF_LIST || '',
     // Current clients typically live in EvokeSchedule2.0's own list (often a different list, sometimes a different site).
-    currentClientsSiteUrl: env.VITE_SP_CURRENT_CLIENTS_SITE_URL || 'https://evokebehavioralhealthcom.sharepoint.com/sites/EvokeIntake',
-    currentClientsListName: env.VITE_SP_CURRENT_CLIENTS_LIST || 'Current Clients',
-    dischargedClientsSiteUrl: env.VITE_SP_DISCHARGED_CLIENTS_SITE_URL || env.VITE_SP_CURRENT_CLIENTS_SITE_URL || 'https://evokebehavioralhealthcom.sharepoint.com/sites/EvokeIntake',
-    dischargedClientsListName: env.VITE_SP_DISCHARGED_CLIENTS_LIST || 'Discharged Clients',
+    currentClientsSiteUrl: env.VITE_SP_CURRENT_CLIENTS_SITE_URL || '',
+    currentClientsListName: env.VITE_SP_CURRENT_CLIENTS_LIST || '',
+    dischargedClientsSiteUrl: env.VITE_SP_DISCHARGED_CLIENTS_SITE_URL || env.VITE_SP_CURRENT_CLIENTS_SITE_URL || '',
+    dischargedClientsListName: env.VITE_SP_DISCHARGED_CLIENTS_LIST || '',
     // Incoming/prospective clients live in this app's own intake list.
-    intakeSiteUrl: env.VITE_SP_INTAKE_SITE_URL || 'https://evokebehavioralhealthcom.sharepoint.com/sites/EvokeIntake',
-    intakeListName: env.VITE_SP_INTAKE_LIST || 'Intake Board',
-    capacityPlanningSiteUrl: env.VITE_SP_CAPACITY_SITE_URL || 'https://evokebehavioralhealthcom.sharepoint.com/sites/EvokeIntake',
-    capacityPlanningListName: env.VITE_SP_CAPACITY_LIST || 'Capacity Planning',
+    intakeSiteUrl: env.VITE_SP_INTAKE_SITE_URL || '',
+    intakeListName: env.VITE_SP_INTAKE_LIST || '',
+    capacityPlanningSiteUrl: env.VITE_SP_CAPACITY_SITE_URL || '',
+    capacityPlanningListName: env.VITE_SP_CAPACITY_LIST || '',
     hrSiteUrl,
-    newHireListName: env.VITE_SP_NEW_HIRE_LIST || 'New Hire Onboarding',
-    dischargedStaffSiteUrl: env.VITE_SP_DISCHARGED_STAFF_SITE_URL || env.VITE_SP_SITE_URL || 'https://evokebehavioralhealthcom.sharepoint.com/sites/Clinistrators',
-    dischargedStaffListName: env.VITE_SP_DISCHARGED_STAFF_LIST || 'Discharged Staff',
+    newHireListName: env.VITE_SP_NEW_HIRE_LIST || '',
+    dischargedStaffSiteUrl: env.VITE_SP_DISCHARGED_STAFF_SITE_URL || env.VITE_SP_SITE_URL || '',
+    dischargedStaffListName: env.VITE_SP_DISCHARGED_STAFF_LIST || '',
     clientId: env.VITE_SP_CLIENT_ID || '',
     tenantId: env.VITE_SP_TENANT_ID || '',
     redirectUri: env.VITE_SP_REDIRECT_URI || fallbackRedirect
@@ -37,6 +40,70 @@ function normalizeSharePointDate(value) {
   if (microsoftDate) return new Date(Number(microsoftDate[1])).toISOString();
   return value;
 }
+
+// Case-insensitive lookup across a list of possible internal-name spellings for the same logical field.
+function readItemField(item, names) {
+  const matchingName = Object.keys(item).find((key) => names.some((name) => key.toLowerCase() === name.toLowerCase()));
+  return matchingName ? item[matchingName] : null;
+}
+
+// Choice/Lookup/Person fields all come back as an object in verbose OData; plain fields come back as-is.
+function readSharePointValue(value) {
+  if (value && typeof value === 'object') {
+    return value.Value || value.Label || value.Title || value.lookupValue || '';
+  }
+  return value || '';
+}
+
+// The Intake list has ~30 optional fields beyond the core ones loadIntakeClients/createIntakeClient
+// handle directly. Each entry's `candidates` are best-effort internal-name guesses (PascalCase, no
+// spaces) - getAvailableFields silently drops any that don't match the real list schema, so a wrong
+// guess just leaves that field blank instead of breaking the load. Check the browser console log
+// ("available columns") after connecting to confirm/correct any that don't come through.
+export const INTAKE_EXTENDED_FIELDS = [
+  { section: 'Client Info', label: 'Preferred Name', key: 'Preferred Name', candidates: ['PreferredName'], kind: 'text' },
+  { section: 'Client Info', label: 'Client DOB', key: 'Client DOB', candidates: ['ClientDOB'], kind: 'date' },
+  { section: 'Client Info', label: 'Gender', key: 'Gender', candidates: ['Gender'], kind: 'text' },
+  { section: 'Client Info', label: 'Diagnosis', key: 'Diagnosis', candidates: ['Diagnosis'], kind: 'textarea' },
+  { section: 'Client Info', label: 'Health Insurance', key: 'Health Insurance', candidates: ['HealthInsurance'], kind: 'text' },
+  { section: 'Client Info', label: 'City', key: 'City', candidates: ['City'], kind: 'text' },
+
+  { section: 'Contact Info', label: 'Email', key: 'Email', candidates: ['Email'], kind: 'text' },
+  { section: 'Contact Info', label: 'Parent/Guardian Name', key: 'Parent Guardian Name', candidates: ['ParentGuardianName'], kind: 'text' },
+  { section: 'Contact Info', label: 'Contact Num', key: 'Contact Num', candidates: ['ContactNum'], kind: 'text' },
+  { section: 'Contact Info', label: 'Preferred Contact', key: 'Preferred Contact', candidates: ['PreferredContact'], kind: 'text' },
+
+  { section: 'Referral Info', label: 'Referred By', key: 'Referred By', candidates: ['RefferedBy'], kind: 'text' },
+  { section: 'Referral Info', label: 'Notes', key: 'Notes', candidates: ['Notes'], kind: 'textarea' },
+
+  { section: 'Internal Intake', label: 'Admission order', key: 'Admission Order', candidates: ['Admissionorder'], kind: 'choice' },
+
+  { section: 'Process Tracking & Compliance', label: 'Intake Email Sent', key: 'Intake Email Sent', candidates: ['IntakeEmailSent'], kind: 'date' },
+  { section: 'Process Tracking & Compliance', label: 'Transpo Requested', key: 'Transpo Requested', candidates: ['TranspoRequested'], kind: 'date' },
+  { section: 'Process Tracking & Compliance', label: 'Handbook Signed', key: 'Handbook Signed', candidates: ['HandbookSigned'], kind: 'date' },
+  { section: 'Process Tracking & Compliance', label: 'Vaccine Record', key: 'Vaccine Record', candidates: ['VaccineRecord'], kind: 'choice' },
+  { section: 'Process Tracking & Compliance', label: 'Physical Form', key: 'Physical Form', candidates: ['PhysicalForm0'], kind: 'choice' },
+  { section: 'Process Tracking & Compliance', label: 'RMHS Elig', key: 'RMHS Elig', candidates: ['RMHSElig'], kind: 'choice' },
+  { section: 'Process Tracking & Compliance', label: 'Medical Clearance Form', key: 'Medical Clearance Form', candidates: ['MedicalClearanceForm'], kind: 'choice' },
+
+  { section: 'Assignments', label: 'BCBA', key: 'BCBA', candidates: ['BCBA'], kind: 'person' },
+  { section: 'Assignments', label: 'DT Program', key: 'DT Program', candidates: ['DTProgram'], kind: 'choice' },
+  { section: 'Assignments', label: 'MHProvider', key: 'MHProvider', candidates: ['MHProvider'], kind: 'person' },
+  { section: 'Assignments', label: 'Classroom', key: 'Classroom', candidates: ['Classroom'], kind: 'choice' },
+  { section: 'Assignments', label: 'Teacher', key: 'Teacher', candidates: ['Teacher'], kind: 'person' },
+  { section: 'Assignments', label: 'Mental Health Services', key: 'Mental Health Services', candidates: ['MentalHealthServices'], kind: 'choice' },
+
+  { section: 'Case Review', label: 'Sent for Review', key: 'Sent for Review', candidates: ['SentforReview'], kind: 'date' },
+  { section: 'Case Review', label: 'Reviewer', key: 'Reviewer', candidates: ['Reviewer'], kind: 'person' },
+  { section: 'Case Review', label: 'IA Scheduled', key: 'IA Scheduled', candidates: ['IA_Scheduled'], kind: 'date' },
+  { section: 'Case Review', label: 'Admissions call', key: 'Admissions Call', candidates: ['Admissionscall'], kind: 'date' },
+  { section: 'Case Review', label: 'Admission Clinician', key: 'Admission Clinician', candidates: ['AdmissionClinician'], kind: 'person' },
+  { section: 'Case Review', label: 'Clinical Consultant', key: 'Clinical Consultant', candidates: ['ClinicalConsultant'], kind: 'person' },
+  { section: 'Case Review', label: 'Clinical Consult Date', key: 'Clinical Consult Date', candidates: ['ClinicalConsultDate'], kind: 'date' },
+
+  { section: 'DC Info', label: 'DC Reason', key: 'DC Reason', candidates: ['DCReason'], kind: 'choice' },
+  { section: 'DC Info', label: 'DC Notes', key: 'DC Notes', candidates: ['DCNotes'], kind: 'textarea' }
+];
 
 export class SharePointDataService {
   constructor(config) {
@@ -160,6 +227,24 @@ export class SharePointDataService {
     }
   }
 
+  // Reads the ordered Choices defined on a Choice field (e.g. a Kanban board's grouping column),
+  // so board columns match SharePoint's own column order/set even for choices with zero items.
+  async getChoiceFieldOptions(siteUrl, listName, fieldInternalName) {
+    const token = await this.getAccessToken();
+    const url = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/fields/getbytitle('${fieldInternalName}')?$select=Choices`;
+
+    try {
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json;odata=verbose' }
+      });
+      if (!response.ok) return [];
+      const payload = await response.json();
+      return payload?.d?.Choices?.results || [];
+    } catch {
+      return [];
+    }
+  }
+
   async getListItems(siteUrl, listName, selectFields, expand) {
     console.log(`📋 Querying SharePoint list '${listName}' at ${siteUrl}`);
     const token = await this.getAccessToken();
@@ -269,7 +354,8 @@ export class SharePointDataService {
       'New_x0020_Position',
       'NewPositionStartDate',
       'New Position Start Date',
-      'NewPositionStart_x0020_Date'
+      'NewPositionStart_x0020_Date',
+      'Program'
     ];
     const select = await this.getAvailableFields(siteUrl, listName, candidateFields);
     const expand = select.some((field) => field.startsWith('StaffPerson/')) ? 'StaffPerson' : undefined;
@@ -308,6 +394,7 @@ export class SharePointDataService {
         endDate: transitionEndDate || normalizeSharePointDate(readSharePointValue(readItemField(['TermDate', 'Term Date', 'Term_x0020_Date'])) || null),
         newPosition,
         newPositionStartDate,
+        program: readSharePointValue(readItemField(['Program'])),
         isActive: forceInactive ? false : item.IsActive !== false
       };
     });
@@ -346,25 +433,32 @@ export class SharePointDataService {
       select
     );
 
-    return items.map((item) => {
-      const intakeStatus = item.IntakeStatus || item.Intake_x0020_Status || '';
-      const isDiscontinued = String(intakeStatus).trim().toLowerCase() === 'discontinued';
-      const dischargeDate = normalizeSharePointDate(item.EndDate || null);
-      const hasDischarged = dischargeDate && new Date(dischargeDate) < new Date();
+    return items
+      .filter((item) => {
+        // A client put back On Hold at the last minute never actually started, even if
+        // a (now stale) Start Date is still on the record - keep them out of Current Clients.
+        const intakeStatus = item.IntakeStatus || item.Intake_x0020_Status || '';
+        return String(intakeStatus).trim().toLowerCase() !== 'on hold';
+      })
+      .map((item) => {
+        const intakeStatus = item.IntakeStatus || item.Intake_x0020_Status || '';
+        const isDiscontinued = String(intakeStatus).trim().toLowerCase() === 'discontinued';
+        const dischargeDate = normalizeSharePointDate(item.EndDate || null);
+        const hasDischarged = dischargeDate && new Date(dischargeDate) < new Date();
 
-      return {
-        id: item.Id,
-        sourceId: item.Id,
-        Title: item.Title || `Client ${item.Id}`,
-        Program: item.UpdatedProgram || '',
-        Services: item.Service || '',
-        'Start Date': normalizeSharePointDate(item.StartDate),
-        'Discharge Date': dischargeDate,
-        'Intake Status': intakeStatus,
-        'Staffing Ratio': item.RatioAM || '1:1',
-        Status: forceInactive || item.IsActive === false || (isDiscontinued && hasDischarged) ? 'Inactive' : 'Active'
-      };
-    });
+        return {
+          id: item.Id,
+          sourceId: item.Id,
+          Title: item.Title || `Client ${item.Id}`,
+          Program: item.UpdatedProgram || '',
+          Services: item.Service || '',
+          'Start Date': normalizeSharePointDate(item.StartDate),
+          'Discharge Date': dischargeDate,
+          'Intake Status': intakeStatus,
+          'Staffing Ratio': item.RatioAM || '1:1',
+          Status: forceInactive || item.IsActive === false || (isDiscontinued && hasDischarged) ? 'Inactive' : 'Active'
+        };
+      });
   }
 
   async loadDischargedClients() {
@@ -381,7 +475,7 @@ export class SharePointDataService {
   }
 
   async loadIntakeClients() {
-    const candidateFields = [
+    const coreFields = [
       'Id',
       'Title',
       'board_x0020_choice',
@@ -393,29 +487,133 @@ export class SharePointDataService {
       'TentativeStartDate',
       'StaffingRatio'
     ];
+    // Person fields need '/Title' to resolve a display name, which also drives which base names get $expand-ed.
+    const extendedFields = INTAKE_EXTENDED_FIELDS.map((field) =>
+      field.kind === 'person' ? `${field.candidates[0]}/Title` : field.candidates[0]
+    );
+    const candidateFields = [...coreFields, ...extendedFields];
     const select = await this.getAvailableFields(this.config.intakeSiteUrl, this.config.intakeListName, candidateFields);
-    const items = await this.getListItems(this.config.intakeSiteUrl, this.config.intakeListName, select);
+    const expand = Array.from(new Set(select.filter((field) => field.includes('/')).map((field) => field.split('/')[0]))).join(',') || undefined;
 
-    return items.map((item) => ({
-      id: item.Id,
-      Title: item.Title || `Prospect ${item.Id}`,
-      'Intake Status': item.board_x0020_choice || 'Initial Inquiry',
-      Services: item.Services || 'ABA',
-      'Inquiry Date': normalizeSharePointDate(item.InquiryDate),
-      'Referral Source': item.ReferralSource || '',
-      'School District': item.SchoolDistrict || '',
-      'Start Date': normalizeSharePointDate(item.StartDate),
-      'Tentative Start Date': normalizeSharePointDate(item.TentativeStartDate),
-      'Staffing Ratio': item.StaffingRatio || '1:1'
-    }));
+    let items;
+    try {
+      items = await this.getListItems(this.config.intakeSiteUrl, this.config.intakeListName, select, expand);
+    } catch (error) {
+      // A guessed 'person' field that's actually a different column type makes $expand 400 -
+      // retry without any expand/sub-selects so the rest of the list still loads.
+      if (!expand) throw error;
+      console.warn('Intake list query with $expand failed, retrying without person-field expansion:', error);
+      const flatSelect = select.map((field) => field.split('/')[0]);
+      items = await this.getListItems(this.config.intakeSiteUrl, this.config.intakeListName, Array.from(new Set(flatSelect)));
+    }
+
+    return items.map((item) => {
+      const extended = {};
+      for (const field of INTAKE_EXTENDED_FIELDS) {
+        const raw = readItemField(item, field.candidates);
+        if (field.kind === 'person') {
+          extended[field.key] = raw?.Title || '';
+        } else if (field.kind === 'date') {
+          extended[field.key] = normalizeSharePointDate(readSharePointValue(raw)) || null;
+        } else {
+          extended[field.key] = readSharePointValue(raw);
+        }
+      }
+
+      return {
+        id: item.Id,
+        Title: item.Title || `Prospect ${item.Id}`,
+        'Intake Status': item.board_x0020_choice || 'Initial Inquiry',
+        // Unlike 'Intake Status' above, keep the raw (possibly blank) value so the Kanban board
+        // can bucket un-set items into an "Unassigned" column instead of defaulting them away.
+        'Board Choice': item.board_x0020_choice || '',
+        Services: item.Services || 'ABA',
+        'Inquiry Date': normalizeSharePointDate(item.InquiryDate),
+        'Referral Source': item.ReferralSource || '',
+        'School District': item.SchoolDistrict || '',
+        'Start Date': normalizeSharePointDate(item.StartDate),
+        'Tentative Start Date': normalizeSharePointDate(item.TentativeStartDate),
+        'Staffing Ratio': item.StaffingRatio || '1:1',
+        // Mirrors the client list's 'Program' key so the app's Program filter works the same way
+        // across current clients and intake/prospective clients.
+        Program: extended['DT Program'] || '',
+        ...extended
+      };
+    });
+  }
+
+  // Mirrors loadIntakeClients' field mapping in reverse, so a new record round-trips
+  // through the same internal SharePoint column names the reader expects. Person fields are
+  // read-only here since resolving a name/email to a SharePoint user ID needs a separate lookup.
+  async createIntakeClient(fields) {
+    const extendedWrites = {};
+    for (const field of INTAKE_EXTENDED_FIELDS) {
+      if (field.kind === 'person') continue;
+      if (fields[field.key] === undefined || fields[field.key] === '') continue;
+      extendedWrites[field.candidates[0]] = fields[field.key];
+    }
+
+    const created = await this.createListItem(this.config.intakeSiteUrl, this.config.intakeListName, {
+      Title: fields.Title,
+      board_x0020_choice: fields['Intake Status'] || 'Initial Inquiry',
+      Services: fields.Services || 'ABA',
+      InquiryDate: fields['Inquiry Date'] || null,
+      ReferralSource: fields['Referral Source'] || '',
+      SchoolDistrict: fields['School District'] || '',
+      StartDate: fields['Start Date'] || null,
+      TentativeStartDate: fields['Tentative Start Date'] || null,
+      StaffingRatio: fields['Staffing Ratio'] || '1:1',
+      ...extendedWrites
+    });
+
+    const extended = {};
+    for (const field of INTAKE_EXTENDED_FIELDS) {
+      extended[field.key] = field.kind === 'person' ? '' : fields[field.key] || (field.kind === 'date' ? null : '');
+    }
+
+    return {
+      id: created.Id,
+      Title: fields.Title,
+      'Intake Status': fields['Intake Status'] || 'Initial Inquiry',
+      'Board Choice': fields['Intake Status'] || '',
+      Services: fields.Services || 'ABA',
+      'Inquiry Date': fields['Inquiry Date'] || null,
+      'Referral Source': fields['Referral Source'] || '',
+      'School District': fields['School District'] || '',
+      'Start Date': fields['Start Date'] || null,
+      'Tentative Start Date': fields['Tentative Start Date'] || null,
+      'Staffing Ratio': fields['Staffing Ratio'] || '1:1',
+      Program: extended['DT Program'] || '',
+      ...extended
+    };
+  }
+
+  // Writes only the fields present in `fields`, using the same internal-name mapping as
+  // createIntakeClient, so edits made in the app round-trip back to the same SharePoint columns.
+  async updateIntakeClient(id, fields) {
+    const writes = {};
+    for (const field of INTAKE_EXTENDED_FIELDS) {
+      if (field.kind === 'person') continue;
+      if (fields[field.key] === undefined) continue;
+      writes[field.candidates[0]] = fields[field.key];
+    }
+    if (fields.Title !== undefined) writes.Title = fields.Title;
+    if (fields['Intake Status'] !== undefined) writes.board_x0020_choice = fields['Intake Status'];
+    if (fields.Services !== undefined) writes.Services = fields.Services;
+    if (fields['Inquiry Date'] !== undefined) writes.InquiryDate = fields['Inquiry Date'] || null;
+    if (fields['Referral Source'] !== undefined) writes.ReferralSource = fields['Referral Source'];
+    if (fields['School District'] !== undefined) writes.SchoolDistrict = fields['School District'];
+    if (fields['Start Date'] !== undefined) writes.StartDate = fields['Start Date'] || null;
+    if (fields['Tentative Start Date'] !== undefined) writes.TentativeStartDate = fields['Tentative Start Date'] || null;
+    if (fields['Staffing Ratio'] !== undefined) writes.StaffingRatio = fields['Staffing Ratio'];
+
+    await this.updateListItem(this.config.intakeSiteUrl, this.config.intakeListName, id, writes);
   }
 
   async loadProspectiveStaff() {
-    const items = await this.getListItems(
-      this.config.hrSiteUrl,
-      this.config.newHireListName,
-      ['Id', 'Title', 'Position', 'TermDate', 'HireType']
-    );
+    const candidateFields = ['Id', 'Title', 'Position', 'TermDate', 'HireType', 'Program'];
+    const select = await this.getAvailableFields(this.config.hrSiteUrl, this.config.newHireListName, candidateFields);
+    const items = await this.getListItems(this.config.hrSiteUrl, this.config.newHireListName, select);
 
     const readSharePointValue = (value) => {
       if (value && typeof value === 'object') {
@@ -438,6 +636,7 @@ export class SharePointDataService {
           position: position.toString().trim(),
           startDate,
           hireType,
+          program: readSharePointValue(item.Program),
           status: 'Upcoming'
         };
       })
@@ -499,14 +698,15 @@ export class SharePointDataService {
     // Authenticate once before firing the four list loads in parallel, so they share one session instead of racing.
     await this.getAccessToken();
 
-    const [staff, dischargedStaff, currentClients, dischargedClients, intakeClients, prospectiveStaff, capacityPlanning] = await Promise.all([
+    const [staff, dischargedStaff, currentClients, dischargedClients, intakeClients, prospectiveStaff, capacityPlanning, intakeBoardColumns] = await Promise.all([
       this.loadStaff(),
       this.loadDischargedStaff(),
       this.loadCurrentClients(),
       this.loadDischargedClients(),
       this.loadIntakeClients(),
       this.loadProspectiveStaff(),
-      this.loadCapacityPlanning()
+      this.loadCapacityPlanning(),
+      this.getChoiceFieldOptions(this.config.intakeSiteUrl, this.config.intakeListName, 'board_x0020_choice')
     ]);
 
     return {
@@ -515,15 +715,33 @@ export class SharePointDataService {
       intakeClients,
       prospectiveStaff,
       capacityPlanning,
+      intakeBoardColumns,
       totalClients: currentClients.length + intakeClients.length,
       lastUpdatedAt: new Date().toISOString()
     };
   }
 }
 
-export function summarizeStaffing(staff) {
+// A staff person - whether sourced from Current Employees or New Hire Onboarding - spends their
+// first STAFF_TRAINING_PERIOD_DAYS as "in training" and isn't yet live/available capacity.
+function isStaffInTraining(startDate, asOfDate) {
+  const start = startDate ? asCalendarDate(startDate) : null;
+  if (!start) return false;
+  const referenceDate = asCalendarDate(asOfDate);
+  if (start > referenceDate) return false;
+  const trainingEnds = new Date(start);
+  trainingEnds.setDate(trainingEnds.getDate() + STAFF_TRAINING_PERIOD_DAYS);
+  return trainingEnds > referenceDate;
+}
+
+export function summarizeStaffing(staff, asOfDate = new Date()) {
   const activeStaff = staff.filter((person) => person.isActive);
-  const availableDirectStaff = activeStaff.filter((person) => isAvailableDirectStaffRole(person.role));
+  const availableDirectStaff = activeStaff.filter(
+    (person) => isAvailableDirectStaffRole(person.role) && !isStaffInTraining(person.startDate, asOfDate)
+  );
+  const trainingDirectStaff = activeStaff.filter(
+    (person) => isAvailableDirectStaffRole(person.role) && isStaffInTraining(person.startDate, asOfDate)
+  );
 
   const byRole = activeStaff.reduce((counts, person) => {
     counts[person.role] = (counts[person.role] || 0) + 1;
@@ -533,6 +751,7 @@ export function summarizeStaffing(staff) {
   return {
     staff,
     activeCount: availableDirectStaff.length,
+    trainingCount: trainingDirectStaff.length,
     totalActiveCount: activeStaff.length,
     byRole,
     lastUpdatedAt: new Date().toISOString()
@@ -676,13 +895,23 @@ export function generateCapacityProjection(
     });
 
     const requiredStaff = calculateRequiredStaff([...activeCurrentClients, ...expectedEnrollments]);
-    const staffInTraining = prospectiveStaff.filter(
+    const staffInTrainingFromProspects = prospectiveStaff.filter(
       (person) =>
         isAvailableDirectStaffRole(person.position) &&
         person.startDate &&
         new Date(person.startDate) <= weekStart &&
         new Date(new Date(person.startDate).setDate(new Date(person.startDate).getDate() + STAFF_TRAINING_PERIOD_DAYS)) > weekStart
     ).length;
+    // New hires already promoted onto the Current Employees roster still serve their training
+    // window there, so they need the same in-training carve-out as prospective staff.
+    const staffInTrainingFromRoster = staffRecords.filter(
+      (person) =>
+        person &&
+        person.isActive !== false &&
+        isAvailableDirectStaffRole(person.role) &&
+        isStaffInTraining(person.startDate, weekStart)
+    ).length;
+    const staffInTraining = staffInTrainingFromProspects + staffInTrainingFromRoster;
     const onboardedByWeek = prospectiveStaff.filter(
       (person) =>
         isAvailableDirectStaffRole(person.position) &&
@@ -698,6 +927,7 @@ export function generateCapacityProjection(
 
       if (startDate && startDate > weekStart) return false;
       if (endDate && weekStart > endDate) return false;
+      if (isStaffInTraining(startDate, weekStart)) return false;
       return true;
     }).length;
     // Base available staff reflects today's direct-care roster, minus any staff already scheduled
