@@ -580,6 +580,66 @@ export default function IntakeCapacityPlanner() {
     };
   });
 
+  const programNames = Array.from(new Set([
+    ...PROGRAM_OPTIONS,
+    ...filteredStaffingSnapshot.staff.map((person) => person.program),
+    ...filteredCurrentClients.map((client) => client.Program),
+    ...filteredIntakeData.map((client) => client.Program),
+    ...filteredProspectiveStaff.map((person) => person.program)
+  ].filter(Boolean)));
+  if (
+    filters.programs.length === 0 &&
+    [
+      ...filteredStaffingSnapshot.staff.map((person) => person.program),
+      ...filteredCurrentClients.map((client) => client.Program),
+      ...filteredIntakeData.map((client) => client.Program),
+      ...filteredProspectiveStaff.map((person) => person.program)
+    ].some((program) => !program)
+  ) {
+    programNames.push('Unassigned');
+  }
+  const programCapacityRows = programNames
+    .filter((program) => filters.programs.length === 0 || filters.programs.includes(program))
+    .map((program) => {
+      const programValue = program === 'Unassigned' ? '' : program;
+      const programClients = filteredCurrentClients.filter((client) => (client.Program || '') === programValue);
+      const programIntake = filteredIntakeData.filter((client) => (client.Program || '') === programValue);
+      const programStaff = filteredStaffingSnapshot.staff.filter((person) => (person.program || '') === programValue);
+      const programProspects = filteredProspectiveStaff.filter((person) => (person.program || '') === programValue);
+      const weeklyProjection = generateCapacityProjection(
+        programClients,
+        programIntake,
+        0,
+        programProspects,
+        projectionWeeks,
+        programStaff,
+        historyWeeks
+      );
+      const horizon = weeklyProjection[weeklyProjection.length - 1];
+      const estimatedMaxClients = Math.max(
+        0,
+        Math.floor(horizon.projectedStaff / REQUIRED_STAFF_PER_CLIENT)
+      );
+      const clientHeadroom = estimatedMaxClients - horizon.projectedStudents;
+
+      return {
+        program,
+        projectedStaff: horizon.projectedStaff,
+        projectedClients: horizon.projectedStudents,
+        estimatedMaxClients,
+        clientHeadroom
+      };
+    });
+  const programCapacityTotal = programCapacityRows.reduce(
+    (total, row) => ({
+      projectedStaff: total.projectedStaff + row.projectedStaff,
+      projectedClients: total.projectedClients + row.projectedClients,
+      estimatedMaxClients: total.estimatedMaxClients + row.estimatedMaxClients,
+      clientHeadroom: total.clientHeadroom + row.clientHeadroom
+    }),
+    { projectedStaff: 0, projectedClients: 0, estimatedMaxClients: 0, clientHeadroom: 0 }
+  );
+
   const historicalProjectionWeeks = projectionChartData.filter((week) => week.isHistorical);
   const currentProjectionWeek = projectionChartData.find((week) => !week.isHistorical);
 
@@ -748,6 +808,7 @@ export default function IntakeCapacityPlanner() {
       id: `current-${person.id}`,
       name: person.name,
       position: person.role,
+      program: person.program,
       source: 'Staff list',
       status: 'Active',
       startDate: person.startDate,
@@ -757,6 +818,7 @@ export default function IntakeCapacityPlanner() {
       id: `upcoming-${person.id}`,
       name: person.name,
       position: person.position,
+      program: person.program,
       source: 'HR New Hire Onboarding',
       status: person.status || 'Upcoming',
       startDate: person.startDate,
@@ -1234,6 +1296,7 @@ export default function IntakeCapacityPlanner() {
                       Staff Member{staffSort.field === 'name' ? (staffSort.direction === 'asc' ? ' ▲' : ' ▼') : ''}
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Position</th>
+                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Program</th>
                     <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Source</th>
                     <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Status</th>
                     <th
@@ -1250,6 +1313,7 @@ export default function IntakeCapacityPlanner() {
                     <tr key={person.id ?? index} className="hover:bg-slate-50">
                       <td className="px-6 py-4 text-sm font-medium text-slate-900">{person.name}</td>
                       <td className="px-6 py-4 text-sm text-slate-600">{person.position || 'N/A'}</td>
+                      <td className="px-6 py-4 text-sm text-slate-600">{person.program || 'N/A'}</td>
                       <td className="px-6 py-4 text-sm text-slate-600">{person.source}</td>
                       <td className="px-6 py-4 text-sm text-slate-600">{person.status}</td>
                       <td className="px-6 py-4 text-sm text-slate-600">{formatDate(person.startDate) || 'N/A'}</td>
@@ -1503,6 +1567,61 @@ export default function IntakeCapacityPlanner() {
                     className="w-full accent-[#352b43]"
                   />
                 </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+              <div className="mb-4">
+                <h2 className="text-xl font-bold text-slate-900">Client Capacity by Program</h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  Staff projected to be available for direct care by {projectionChartData[projectionChartData.length - 1]?.week || 'the selected date'}.
+                </p>
+                <p className="mt-1 text-sm text-slate-600">
+                  Estimated maximum assumes {REQUIRED_STAFF_PER_CLIENT} staff per client; actual capacity varies with each client&apos;s staffing ratio.
+                </p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[720px] text-left">
+                  <thead className="border-b border-slate-200 bg-slate-50">
+                    <tr>
+                      <th className="px-4 py-3 text-xs font-semibold text-slate-700">Program</th>
+                      <th className="px-4 py-3 text-right text-xs font-semibold text-slate-700">Projected available staff</th>
+                      <th className="px-4 py-3 text-right text-xs font-semibold text-slate-700">Projected clients</th>
+                      <th className="px-4 py-3 text-right text-xs font-semibold text-slate-700">Estimated max clients</th>
+                      <th className="px-4 py-3 text-right text-xs font-semibold text-slate-700">Room / shortfall</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200">
+                    {programCapacityRows.map((row) => (
+                      <tr key={row.program} className="hover:bg-slate-50">
+                        <th scope="row" className="px-4 py-4 text-sm font-semibold text-slate-900">{row.program}</th>
+                        <td className="px-4 py-4 text-right text-sm text-slate-700">{row.projectedStaff}</td>
+                        <td className="px-4 py-4 text-right text-sm text-slate-700">{row.projectedClients}</td>
+                        <td className="px-4 py-4 text-right text-lg font-bold text-[#352b43]">{row.estimatedMaxClients}</td>
+                        <td className={`px-4 py-4 text-right text-sm font-semibold ${row.clientHeadroom < 0 ? 'text-[#a84b2a]' : 'text-emerald-700'}`}>
+                          {row.clientHeadroom < 0
+                            ? `${Math.abs(row.clientHeadroom)} over estimate`
+                            : `${row.clientHeadroom} client${row.clientHeadroom === 1 ? '' : 's'} room`}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot className="border-t-2 border-slate-300 bg-slate-50">
+                    <tr>
+                      <th scope="row" className="px-4 py-4 text-sm font-bold text-slate-900">
+                        {filters.programs.length > 1 ? `Selected programs total (${programCapacityRows.length})` : 'Total'}
+                      </th>
+                      <td className="px-4 py-4 text-right text-sm font-bold text-slate-900">{programCapacityTotal.projectedStaff}</td>
+                      <td className="px-4 py-4 text-right text-sm font-bold text-slate-900">{programCapacityTotal.projectedClients}</td>
+                      <td className="px-4 py-4 text-right text-lg font-bold text-[#352b43]">{programCapacityTotal.estimatedMaxClients}</td>
+                      <td className={`px-4 py-4 text-right text-sm font-bold ${programCapacityTotal.clientHeadroom < 0 ? 'text-[#a84b2a]' : 'text-emerald-700'}`}>
+                        {programCapacityTotal.clientHeadroom < 0
+                          ? `${Math.abs(programCapacityTotal.clientHeadroom)} over estimate`
+                          : `${programCapacityTotal.clientHeadroom} client${programCapacityTotal.clientHeadroom === 1 ? '' : 's'} room`}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
               </div>
             </div>
 
