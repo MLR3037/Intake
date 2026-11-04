@@ -18,7 +18,7 @@ import {
   XAxis,
   YAxis
 } from 'recharts';
-import { AlertCircle, ChevronDown, Download, Filter } from 'lucide-react';
+import { AlertCircle, ChevronDown, Download, Filter, MessageSquare, X } from 'lucide-react';
 import {
   applyWhatIfAdjustments,
   exportIntakeDataToCSV,
@@ -147,6 +147,7 @@ const MOCK_CURRENT_CLIENTS = [
     id: 'c3',
     Title: 'Amelia Brown',
     Services: 'School Services',
+    Teacher: 'Taylor Morgan',
     'Start Date': '2026-07-01',
     'Discharge Date': '2026-08-22',
     'Staffing Ratio': '1:1',
@@ -155,6 +156,16 @@ const MOCK_CURRENT_CLIENTS = [
     'DT Program': false,
     Classroom: true,
     Status: 'Active'
+  },
+  {
+    id: 'c4',
+    Title: 'Noah Wilson',
+    Services: 'School Services',
+    Teacher: 'Riley Carter',
+    'Start Date': '2026-06-15',
+    'Discharge Date': '2026-12-31',
+    'Staffing Ratio': '1:1',
+    Status: 'Active'
   }
 ];
 
@@ -162,15 +173,19 @@ const MOCK_STAFF = [
   { id: 's1', name: 'Marin Patel', role: 'RBT', isActive: true },
   { id: 's2', name: 'Jordan Kim', role: 'RBT', isActive: true },
   { id: 's3', name: 'Avery Nguyen', role: 'BS', isActive: true },
-  { id: 's4', name: 'Casey Brooks', role: 'RBT', isActive: true }
+  { id: 's4', name: 'Casey Brooks', role: 'RBT', isActive: true },
+  { id: 's5', name: 'Taylor Morgan', role: 'Special Education Teacher', isActive: true },
+  { id: 's6', name: 'Riley Carter', role: 'Interim Special Education Teacher', isActive: true }
 ];
 
 const INTAKE_STATUS_ORDER = [
   'Initial Inquiry',
   'Contacted Referral',
   'Sent Intake Email',
-  'Intake Completed',
-  'On Hold'
+  'Intake Paperwork in progress',
+  'Initial assessment scheduled',
+  'ready to start',
+  'on hold'
 ];
 
 const SERVICES_OPTIONS = ['ABA', 'School Services'];
@@ -234,9 +249,12 @@ function normalizeIntakeStatus(value) {
     initialinquiry: 'Initial Inquiry',
     contactedreferral: 'Contacted Referral',
     sentintakeemail: 'Sent Intake Email',
-    intakecompleted: 'Intake Completed',
-    readytostartintakecompleted: 'Intake Completed',
-    onhold: 'On Hold'
+    intakepaperworkinprogress: 'Intake Paperwork in progress',
+    initialassessmentscheduled: 'Initial assessment scheduled',
+    readytostart: 'ready to start',
+    intakecompleted: 'ready to start',
+    readytostartintakecompleted: 'ready to start',
+    onhold: 'on hold'
   };
   return statusMap[normalized] || String(value || '').trim();
 }
@@ -263,6 +281,19 @@ function alphabetizeNames(items, getName = (item) => item.name || item.Title) {
   );
 }
 
+function hasSchoolServices(value) {
+  return String(value || '')
+    .split(/[;,]/)
+    .some((service) => service.trim().toLowerCase() === 'school services');
+}
+
+function getNormalizedAssignments(value) {
+  return String(value || '')
+    .split(/[;,]/)
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 export default function IntakeCapacityPlanner() {
   const [authToken, setAuthToken] = useState(null);
   const [intakeData, setIntakeData] = useState(MOCK_INTAKE_DATA);
@@ -270,6 +301,7 @@ export default function IntakeCapacityPlanner() {
   const [staffingSnapshot, setStaffingSnapshot] = useState(() => summarizeStaffing(MOCK_STAFF));
   const [prospectiveStaff, setProspectiveStaff] = useState([]);
   const [capacityPlanning, setCapacityPlanning] = useState([]);
+  const [initializingAvailabilityRows, setInitializingAvailabilityRows] = useState(() => new Set());
   const [boardColumns, setBoardColumns] = useState([]);
   const [syncLoading, setSyncLoading] = useState(false);
   const [syncConnected, setSyncConnected] = useState(false);
@@ -296,6 +328,10 @@ export default function IntakeCapacityPlanner() {
   const [showIntakeForm, setShowIntakeForm] = useState(false);
   const [editingIntakeItem, setEditingIntakeItem] = useState(null);
   const [selectedIntakeItem, setSelectedIntakeItem] = useState(null);
+  const [selectedCallLogClient, setSelectedCallLogClient] = useState(null);
+  const [callLog, setCallLog] = useState([]);
+  const [callLogSaving, setCallLogSaving] = useState(false);
+  const [callLogError, setCallLogError] = useState('');
   const [intakeFormError, setIntakeFormError] = useState('');
   const [intakeFormSaving, setIntakeFormSaving] = useState(false);
   const [sharePointConfig] = useState(() => getSharePointConfig());
@@ -349,6 +385,7 @@ export default function IntakeCapacityPlanner() {
       setProspectiveStaff(snapshot.prospectiveStaff || []);
       setCapacityPlanning(snapshot.capacityPlanning || []);
       setBoardColumns(snapshot.intakeBoardColumns || []);
+      setCallLog(snapshot.callLog || []);
       setSyncConnected(true);
       setLastSyncedAt(snapshot.lastUpdatedAt);
     } catch (error) {
@@ -358,6 +395,22 @@ export default function IntakeCapacityPlanner() {
       setSyncError(error.errorCode ? `${error.errorCode}: ${error.errorMessage || error.message}` : error.message || 'Failed to load SharePoint data');
     } finally {
       setSyncLoading(false);
+    }
+  };
+
+  const handleAddCallLogEntry = async (contactType, comment) => {
+    if (!selectedCallLogClient) return;
+    setCallLogSaving(true);
+    setCallLogError('');
+    try {
+      const entry = await sharePointService.createCallLogEntry(selectedCallLogClient.id, contactType, comment);
+      setCallLog((entries) => [entry, ...entries]);
+    } catch (error) {
+      console.error('Failed to save call-log entry:', error);
+      setCallLogError(error.message || 'Failed to save comment');
+      throw error;
+    } finally {
+      setCallLogSaving(false);
     }
   };
 
@@ -442,17 +495,55 @@ export default function IntakeCapacityPlanner() {
     : prospectiveStaff;
   const sortedIntakeData = alphabetizeNames(filteredIntakeData);
   const sortedCurrentClients = alphabetizeNames(filteredCurrentClients);
+  const schoolServiceClients = currentClients.filter(
+    (client) => hasSchoolServices(client.Services) && client.Status !== 'Inactive'
+  );
+  const matchesTeacherAssignment = (client, teacher) => {
+    const assignedNames = getNormalizedAssignments(client.Teacher);
+    const teacherName = String(teacher.name || '').trim().toLowerCase();
+    const teacherEmail = String(teacher.email || '').trim().toLowerCase();
+    const assignedEmail = String(client.TeacherEmail || '').trim().toLowerCase();
+    return assignedNames.includes(teacherName) || Boolean(teacherEmail && assignedEmail && teacherEmail === assignedEmail);
+  };
+  const teacherRows = alphabetizeNames(
+    staffingSnapshot.staff
+      .filter((person) => person.isActive !== false && /teacher/i.test(String(person.role || '')))
+      .map((person) => {
+        const caseload = schoolServiceClients.filter((client) => matchesTeacherAssignment(client, person));
+        const title = String(person.role || '').trim();
+        const normalizedTitle = title.toLowerCase();
+        const isSpedTeacher = normalizedTitle.includes('sped') || normalizedTitle.includes('special education');
+        const maxCapacity = isSpedTeacher
+          ? normalizedTitle.includes('interim') ? 8 : 10
+          : null;
+
+        return {
+          ...person,
+          title,
+          caseload,
+          maxCapacity,
+          availableCapacity: maxCapacity === null ? null : maxCapacity - caseload.length
+        };
+      })
+  );
+  const unassignedSchoolServiceClients = schoolServiceClients.filter(
+    (client) => !teacherRows.some((teacher) => matchesTeacherAssignment(client, teacher))
+  );
+  const hasSchoolServiceAssignments = schoolServiceClients.some(
+    (client) => getNormalizedAssignments(client.Teacher).length > 0
+  );
 
   const funnelData = INTAKE_STATUS_ORDER.map((status) => ({
     status,
     count: filteredIntakeData.filter((item) => normalizeIntakeStatus(item['Intake Status']) === status).length
   }));
 
-  // Falls back to whatever board values already appear in the data if the live Choices lookup
-  // came back empty (e.g. still on the local mock snapshot).
-  const boardColumnNames = boardColumns.length > 0
+  // Enforce the intake sequence on the board itself, while still keeping any additional board
+  // choices in the list after the known stages.
+  const boardColumnSource = boardColumns.length > 0
     ? boardColumns
     : Array.from(new Set(intakeData.map((item) => item['Board Choice']).filter(Boolean)));
+  const boardColumnNames = [...new Set([...INTAKE_STATUS_ORDER, ...boardColumnSource])];
   // Unassigned items get their own block above the board, so the scrollable row starts with the first real stage.
   const boardColumnList = [UNASSIGNED_COLUMN, ...boardColumnNames];
   const boardColumnData = boardColumnList.map((column) => ({
@@ -674,7 +765,7 @@ export default function IntakeCapacityPlanner() {
     ...intakeData
       .filter((client) =>
         (client['Start Date'] || client['Tentative Start Date']) &&
-        normalizeIntakeStatus(client['Intake Status']) !== 'On Hold' &&
+        normalizeIntakeStatus(client['Intake Status']) !== 'on hold' &&
         (filters.programs.length === 0 || filters.programs.includes(client.Program))
       )
       .map((client) => ({
@@ -696,12 +787,15 @@ export default function IntakeCapacityPlanner() {
     )
   })), (person) => person.name);
 
+  const hasAvailability = (person, field) =>
+    person.planning ? Boolean(person.planning.availability?.[field]) : true;
+
   const availabilityTotals = WEEKDAYS.map((day) => ({
     ...day,
-    amClients: planningRows.filter((person) => person.planning?.availability?.[`${day.key}AM`]).length,
-    pmClients: planningRows.filter((person) => person.planning?.availability?.[`${day.key}PM`]).length,
-    amRequiredStaff: Number((planningRows.reduce((sum, person) => sum + (person.planning?.availability?.[`${day.key}AM`] ? getRequiredStaffUnits(person) : 0), RESERVED_CLIENT_SPOTS)).toFixed(2)),
-    pmRequiredStaff: Number((planningRows.reduce((sum, person) => sum + (person.planning?.availability?.[`${day.key}PM`] ? getRequiredStaffUnits(person) : 0), RESERVED_CLIENT_SPOTS)).toFixed(2)),
+    amClients: planningRows.filter((person) => hasAvailability(person, `${day.key}AM`)).length,
+    pmClients: planningRows.filter((person) => hasAvailability(person, `${day.key}PM`)).length,
+    amRequiredStaff: Number((planningRows.reduce((sum, person) => sum + (hasAvailability(person, `${day.key}AM`) ? getRequiredStaffUnits(person) : 0), RESERVED_CLIENT_SPOTS)).toFixed(2)),
+    pmRequiredStaff: Number((planningRows.reduce((sum, person) => sum + (hasAvailability(person, `${day.key}PM`) ? getRequiredStaffUnits(person) : 0), RESERVED_CLIENT_SPOTS)).toFixed(2)),
     amAvailableStaff: projectedAvailabilityStaff,
     pmAvailableStaff: projectedAvailabilityStaff
   }));
@@ -734,7 +828,7 @@ export default function IntakeCapacityPlanner() {
   const updateAvailability = async (planningRow, field, value) => {
     let planning = planningRow.planning;
     if (!planning) {
-      const availability = Object.fromEntries(AVAILABILITY_FIELDS.map((name) => [name, false]));
+      const availability = Object.fromEntries(AVAILABILITY_FIELDS.map((name) => [name, true]));
       availability[field] = value;
       const created = await sharePointService.createListItem(
         sharePointConfig.capacityPlanningSiteUrl,
@@ -789,6 +883,71 @@ export default function IntakeCapacityPlanner() {
     }
   };
 
+  const initializedAvailabilityRowsRef = useRef(new Set());
+  useEffect(() => {
+    if (!syncConnected || view !== 'availability') return;
+
+    const initializeMissingRows = async () => {
+      const missingRows = planningRows.filter((planningRow) => {
+        const key = `${planningRow.sourceList}:${planningRow.sourceId}`;
+        return !planningRow.planning && !initializedAvailabilityRowsRef.current.has(key);
+      });
+      if (missingRows.length === 0) return;
+
+      for (const planningRow of missingRows) {
+        const key = `${planningRow.sourceList}:${planningRow.sourceId}`;
+        initializedAvailabilityRowsRef.current.add(key);
+      }
+      setInitializingAvailabilityRows((rows) =>
+        new Set([...rows, ...missingRows.map((row) => `${row.sourceList}:${row.sourceId}`)])
+      );
+
+      for (const planningRow of missingRows) {
+        const key = `${planningRow.sourceList}:${planningRow.sourceId}`;
+        const availability = Object.fromEntries(AVAILABILITY_FIELDS.map((field) => [field, true]));
+        try {
+          const created = await sharePointService.createListItem(
+            sharePointConfig.capacityPlanningSiteUrl,
+            sharePointConfig.capacityPlanningListName,
+            {
+              Title: planningRow.name,
+              SourceList: planningRow.sourceList,
+              SourceID: Number(planningRow.sourceId),
+              PersonType: planningRow.personType,
+              ...availability
+            }
+          );
+          const planning = {
+            id: created.Id,
+            sourceList: planningRow.sourceList,
+            sourceId: planningRow.sourceId,
+            personType: planningRow.personType,
+            availability
+          };
+          setCapacityPlanning((rows) =>
+            rows.some((row) =>
+              normalizeSourceList(row.sourceList) === normalizeSourceList(planning.sourceList) &&
+              row.sourceId === planning.sourceId
+            )
+              ? rows
+              : [...rows, planning]
+          );
+        } catch (error) {
+          console.error(`Failed to initialize availability for ${planningRow.name}:`, error);
+          setSyncError(error.message || `Failed to initialize availability for ${planningRow.name}`);
+        } finally {
+          setInitializingAvailabilityRows((rows) => {
+            const next = new Set(rows);
+            next.delete(key);
+            return next;
+          });
+        }
+      }
+    };
+
+    initializeMissingRows();
+  }, [syncConnected, view, planningRows, sharePointService, sharePointConfig]);
+
   const stats = {
     totalProspects: filteredIntakeData.length,
     readyToEnroll: filteredIntakeData.filter(
@@ -810,7 +969,7 @@ export default function IntakeCapacityPlanner() {
       position: person.role,
       program: person.program,
       source: 'Staff list',
-      status: 'Active',
+      status: person.status || 'N/A',
       startDate: person.startDate,
       endDate: person.endDate
     })),
@@ -898,6 +1057,7 @@ export default function IntakeCapacityPlanner() {
                 <option value="details">Prospective Clients</option>
                 <option value="board">Intake Board</option>
                 <option value="currentClients">Current Clients</option>
+                <option value="teacherCaseload">Teacher Caseload &amp; Availability</option>
                 <option value="staff">Staff</option>
                 <option value="availability">Availability Planning</option>
                 <option value="projections">Capacity Projections</option>
@@ -923,7 +1083,7 @@ export default function IntakeCapacityPlanner() {
           {syncError && <p className="mt-1 text-[#a84b2a]">{syncError}</p>}
         </div>
 
-        <div className="mb-6 rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+        {view !== 'teacherCaseload' && <div className="mb-6 rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
           <div className="mb-4 flex items-center gap-2">
             <Filter size={18} className="text-slate-600" />
             <h3 className="font-semibold text-slate-900">Filters</h3>
@@ -1002,7 +1162,7 @@ export default function IntakeCapacityPlanner() {
               only applies to the pipeline, since active current clients aren't staged in the intake funnel.
             </p>
           )}
-        </div>
+        </div>}
 
         {view === 'dashboard' && (
           <div className="space-y-6">
@@ -1228,6 +1388,8 @@ export default function IntakeCapacityPlanner() {
                 syncConnected={syncConnected}
                 onDrop={handleBoardCardDrop}
                 onSelect={setSelectedIntakeItem}
+                onCallLog={setSelectedCallLogClient}
+                callLog={callLog}
                 className="w-full"
               />
             )}
@@ -1242,6 +1404,8 @@ export default function IntakeCapacityPlanner() {
                     syncConnected={syncConnected}
                     onDrop={handleBoardCardDrop}
                     onSelect={setSelectedIntakeItem}
+                    onCallLog={setSelectedCallLogClient}
+                    callLog={callLog}
                     className="w-64 flex-shrink-0"
                   />
                 ))}
@@ -1326,6 +1490,98 @@ export default function IntakeCapacityPlanner() {
           </div>
         )}
 
+        {view === 'teacherCaseload' && (
+          <div className="space-y-6">
+            <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+              <div className="border-b border-slate-200 px-6 py-4">
+                <h2 className="text-xl font-bold text-slate-900">Teacher Caseload &amp; Availability</h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  {schoolServiceClients.length} active School Services {schoolServiceClients.length === 1 ? 'client' : 'clients'} found. Clients are grouped by their assigned teacher. SPED teachers have a capacity of 10; interim SPED teachers have a capacity of 8.
+                </p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead className="border-b border-slate-200 bg-slate-50">
+                    <tr>
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Teacher</th>
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Title</th>
+                      <th className="px-6 py-3 text-right text-xs font-semibold text-slate-700">Caseload</th>
+                      <th className="px-6 py-3 text-right text-xs font-semibold text-slate-700">Max Capacity</th>
+                      <th className="px-6 py-3 text-right text-xs font-semibold text-slate-700">Available</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200">
+                    {teacherRows.map((teacher) => (
+                      <tr key={teacher.id} className="hover:bg-slate-50">
+                        <td className="px-6 py-4 text-sm font-medium text-slate-900">{teacher.name}</td>
+                        <td className="px-6 py-4 text-sm text-slate-600">{teacher.title}</td>
+                        <td className="px-6 py-4 text-right text-sm text-slate-600">{teacher.caseload.length}</td>
+                        <td className="px-6 py-4 text-right text-sm text-slate-600">{teacher.maxCapacity ?? 'N/A'}</td>
+                        <td className={`px-6 py-4 text-right text-sm font-semibold ${teacher.availableCapacity < 0 ? 'text-[#a84b2a]' : 'text-slate-700'}`}>
+                          {teacher.availableCapacity ?? 'N/A'}
+                        </td>
+                      </tr>
+                    ))}
+                    {teacherRows.length === 0 && (
+                      <tr>
+                        <td colSpan="5" className="px-6 py-8 text-center text-sm text-slate-500">
+                          No active teachers found in the employee list.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {teacherRows.map((teacher) => (
+                <div key={`caseload-${teacher.id}`} className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="mb-4 border-b border-slate-100 pb-3">
+                    <h3 className="font-bold text-slate-900">{teacher.name}</h3>
+                    <p className="text-sm text-slate-600">{teacher.title}</p>
+                  </div>
+                  {teacher.caseload.length > 0 ? (
+                    <ul className="space-y-2">
+                      {alphabetizeNames(teacher.caseload).map((client) => (
+                        <li key={client.id} className="flex items-center justify-between gap-3 text-sm">
+                          <span className="font-medium text-slate-800">{client.Title}</span>
+                          <span className="shrink-0 text-slate-500">{client.Program || 'School Services'}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-sm text-slate-500">No active School Services clients assigned.</p>
+                  )}
+                  <p className="mt-4 border-t border-slate-100 pt-3 text-sm font-medium text-slate-700">
+                    {teacher.availableCapacity === null
+                      ? `${teacher.caseload.length} assigned`
+                      : `${teacher.availableCapacity} of ${teacher.maxCapacity} spots available`}
+                  </p>
+                </div>
+              ))}
+            </section>
+
+            {unassignedSchoolServiceClients.length > 0 && (
+              <section className="rounded-lg border border-[#d9a441] bg-white p-5 shadow-sm">
+                <h3 className="font-bold text-slate-900">Unassigned School Services Clients</h3>
+                {!hasSchoolServiceAssignments && (
+                  <p className="mt-2 text-sm text-slate-600">
+                    No teacher assignments were returned by the connected Clients list, so these clients cannot be grouped by teacher.
+                  </p>
+                )}
+                <ul className="mt-3 space-y-2">
+                  {alphabetizeNames(unassignedSchoolServiceClients).map((client) => (
+                    <li key={client.id} className="text-sm text-slate-700">
+                      {client.Title} <span className="text-slate-500">{client.Teacher ? `(assigned to ${client.Teacher}, not in the active employee list)` : '(no teacher assigned)'}</span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+          </div>
+        )}
+
         {view === 'availability' && (
           <div className="space-y-6">
             <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
@@ -1347,7 +1603,7 @@ export default function IntakeCapacityPlanner() {
                 </label>
               </div>
               <p className="mb-4 text-sm text-slate-600">
-                Check each AM/PM period from the Capacity Planning SharePoint list. Required staff is based on the clients present in each period. The projection includes {projectedAvailabilityStaff} live direct-care staff by {formatDate(availabilityProjectionDate)}; {projectedAvailabilityTraining} additional hire{projectedAvailabilityTraining === 1 ? '' : 's'} {projectedAvailabilityTraining === 1 ? 'is' : 'are'} still in training.
+                New clients with a start date are checked for every AM/PM period by default; adjust them to match their actual schedule. These selections drive the Open Schedule Gaps below, not the separate Capacity Projections view. Staffing here includes {projectedAvailabilityStaff} live direct-care staff by {formatDate(availabilityProjectionDate)}; {projectedAvailabilityTraining} additional hire{projectedAvailabilityTraining === 1 ? '' : 's'} {projectedAvailabilityTraining === 1 ? 'is' : 'are'} still in training.
               </p>
               <div className="mb-6 grid grid-cols-1 gap-3 md:grid-cols-5">
                 {availabilityTotals.map((day) => (
@@ -1441,14 +1697,16 @@ export default function IntakeCapacityPlanner() {
                           <button
                             type="button"
                             onClick={() => setAllRowAvailability(person, true)}
-                            className="text-xs font-medium text-[#3f425e] hover:text-[#352b43]"
+                            disabled={initializingAvailabilityRows.has(`${person.sourceList}:${person.sourceId}`)}
+                            className="text-xs font-medium text-[#3f425e] hover:text-[#352b43] disabled:cursor-wait disabled:opacity-50"
                           >
                             Check all
                           </button>
                           <button
                             type="button"
                             onClick={() => setAllRowAvailability(person, false)}
-                            className="ml-2 text-xs font-medium text-slate-500 hover:text-slate-700"
+                            disabled={initializingAvailabilityRows.has(`${person.sourceList}:${person.sourceId}`)}
+                            className="ml-2 text-xs font-medium text-slate-500 hover:text-slate-700 disabled:cursor-wait disabled:opacity-50"
                           >
                             Clear
                           </button>
@@ -1457,8 +1715,9 @@ export default function IntakeCapacityPlanner() {
                           <td key={field} className="px-2 py-3 text-center">
                             <input
                               type="checkbox"
-                              checked={Boolean(person.planning?.availability?.[field])}
+                              checked={hasAvailability(person, field)}
                               title={`Save ${field} for ${person.name}`}
+                              disabled={initializingAvailabilityRows.has(`${person.sourceList}:${person.sourceId}`)}
                               onChange={(event) => updateAvailability(person, field, event.target.checked)}
                               className="h-4 w-4 accent-[#3f425e] disabled:cursor-not-allowed"
                             />
@@ -1832,6 +2091,10 @@ export default function IntakeCapacityPlanner() {
         <IntakeDetailModal
           item={selectedIntakeItem}
           onClose={() => setSelectedIntakeItem(null)}
+          onCallLog={() => {
+            setSelectedIntakeItem(null);
+            setSelectedCallLogClient(selectedIntakeItem);
+          }}
           onEdit={
             syncConnected
               ? () => {
@@ -1841,6 +2104,20 @@ export default function IntakeCapacityPlanner() {
                 }
               : null
           }
+        />
+      )}
+
+      {selectedCallLogClient && (
+        <CallLogModal
+          item={selectedCallLogClient}
+          entries={callLog.filter((entry) => String(entry.intakeClientId) === String(selectedCallLogClient.id))}
+          saving={callLogSaving}
+          error={callLogError}
+          onClose={() => {
+            setSelectedCallLogClient(null);
+            setCallLogError('');
+          }}
+          onSubmit={handleAddCallLogEntry}
         />
       )}
     </div>
@@ -1915,7 +2192,7 @@ function StatCard({ title, value, subtitle, color }) {
   );
 }
 
-function BoardColumn({ column, items, syncConnected, onDrop, onSelect, className }) {
+function BoardColumn({ column, items, syncConnected, onDrop, onSelect, onCallLog, callLog, className }) {
   const cardFields = [
     { key: 'Title', label: 'Client' },
     { key: 'Inquiry Date', label: 'Inquiry Date', kind: 'date' },
@@ -1957,6 +2234,18 @@ function BoardColumn({ column, items, syncConnected, onDrop, onSelect, className
                 </p>
               </React.Fragment>
             ))}
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onCallLog(item);
+              }}
+              className="mt-2 flex w-full items-center justify-between border-t border-slate-100 pt-2 text-left text-xs font-semibold text-[#3f425e] hover:text-[#a84b2a]"
+              aria-label={`Open call log for ${item.Title}`}
+            >
+              <span className="flex items-center gap-1.5"><MessageSquare size={14} /> Call log</span>
+              <span>{callLog.filter((entry) => String(entry.intakeClientId) === String(item.id)).length}</span>
+            </button>
           </div>
         ))}
       </div>
@@ -1964,13 +2253,106 @@ function BoardColumn({ column, items, syncConnected, onDrop, onSelect, className
   );
 }
 
-function IntakeDetailModal({ item, onClose, onEdit }) {
+function CallLogModal({ item, entries, saving, error, onClose, onSubmit }) {
+  const [contactType, setContactType] = useState('Phone call');
+  const [comment, setComment] = useState('');
+  const [formError, setFormError] = useState('');
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    if (!comment.trim()) {
+      setFormError('Enter a comment before saving.');
+      return;
+    }
+    setFormError('');
+    try {
+      await onSubmit(contactType, comment.trim());
+      setComment('');
+    } catch {
+      // The parent displays the SharePoint error while keeping the form available for retry.
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="max-h-[85vh] w-full max-w-2xl overflow-y-auto rounded-lg bg-white p-6 shadow-xl">
+        <div className="mb-5 flex items-start justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Call log</p>
+            <h2 className="mt-1 text-xl font-bold text-slate-900">{item.Title}</h2>
+          </div>
+          <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-600" aria-label="Close call log">
+            <X size={20} />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="mb-6 rounded-lg bg-slate-50 p-4">
+          <div className="grid gap-3 sm:grid-cols-[10rem_1fr]">
+            <label className="text-sm font-medium text-slate-700">
+              Contact type
+              <select
+                value={contactType}
+                onChange={(event) => setContactType(event.target.value)}
+                className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              >
+                <option>Phone call</option>
+                <option>Email</option>
+                <option>Other</option>
+              </select>
+            </label>
+            <label className="text-sm font-medium text-slate-700">
+              Comment
+              <textarea
+                value={comment}
+                onChange={(event) => setComment(event.target.value)}
+                rows={3}
+                placeholder="Add a call or contact note..."
+                className="mt-1 w-full resize-y rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              />
+            </label>
+          </div>
+          {(formError || error) && <p className="mt-2 text-sm text-[#a84b2a]">{formError || error}</p>}
+          <div className="mt-3 flex justify-end">
+            <button type="submit" disabled={saving} className="rounded-md bg-[#352b43] px-4 py-2 text-sm font-semibold text-white hover:bg-[#211b21] disabled:cursor-not-allowed disabled:opacity-60">
+              {saving ? 'Saving...' : 'Add comment'}
+            </button>
+          </div>
+        </form>
+
+        <div className="space-y-3">
+          {entries.length === 0 ? (
+            <p className="text-sm text-slate-500">No comments yet.</p>
+          ) : entries.map((entry) => (
+            <article key={entry.id} className="border-l-2 border-[#a7c0be] pl-3">
+              <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                <span className="text-sm font-semibold text-slate-900">{entry.contactType || 'Other'}</span>
+                <span className="text-xs text-slate-500">{entry.author}</span>
+                <time className="text-xs text-slate-500">{formatDateTime(entry.createdAt)}</time>
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{entry.comment}</p>
+            </article>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function IntakeDetailModal({ item, onClose, onCallLog, onEdit }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
       <div className="max-h-[85vh] w-full max-w-3xl overflow-y-auto rounded-lg bg-white p-6 shadow-xl">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-xl font-bold text-slate-900">{item.Title}</h2>
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={onCallLog}
+              className="flex items-center gap-1.5 rounded-lg border border-[#3f425e] px-3 py-1.5 text-sm font-semibold text-[#3f425e] transition-colors hover:bg-[#edf3f2]"
+            >
+              <MessageSquare size={15} />
+              Call log
+            </button>
             {onEdit && (
               <button
                 onClick={onEdit}
@@ -2277,7 +2659,10 @@ function StatusBadge({ status }) {
     'Initial Inquiry': 'bg-[#beb7c8]/30 text-[#352b43]',
     'Contacted Referral': 'bg-[#f1f1f1] text-[#3f425e]',
     'Sent Intake Email': 'bg-[#edf3f2] text-[#3f425e]',
-    'Intake Completed': 'bg-[#e5e0eb] text-[#352b43]',
+    'Intake Paperwork in progress': 'bg-[#e7f1ff] text-[#2d4a7f]',
+    'Initial assessment scheduled': 'bg-[#f7efe3] text-[#7a4f1f]',
+    'ready to start': 'bg-[#e5e0eb] text-[#352b43]',
+    'on hold': 'bg-[#fbe7e7] text-[#8a3b3b]',
     'Awaiting Clinician Review': 'bg-[#fff4d6] text-[#9a6b08]',
     Enrolled: 'bg-[#f8e9e3] text-[#a84b2a]'
   };
@@ -2332,6 +2717,17 @@ function formatDate(dateString) {
   });
 }
 
+function formatDateTime(dateString) {
+  if (!dateString) return '';
+  return new Date(dateString).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  });
+}
+
 function calculateAverageRatio(clients) {
   if (!clients.length) return 'N/A';
   const ratios = clients.map((client) => {
@@ -2343,4 +2739,3 @@ function calculateAverageRatio(clients) {
   const average = (ratios.reduce((sum, value) => sum + value, 0) / ratios.length).toFixed(1);
   return `1:${average}`;
 }
-

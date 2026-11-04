@@ -23,6 +23,8 @@ export function getSharePointConfig() {
     intakeListName: env.VITE_SP_INTAKE_LIST || '',
     capacityPlanningSiteUrl: env.VITE_SP_CAPACITY_SITE_URL || '',
     capacityPlanningListName: env.VITE_SP_CAPACITY_LIST || '',
+    callLogSiteUrl: env.VITE_SP_CALL_LOG_SITE_URL || env.VITE_SP_INTAKE_SITE_URL || '',
+    callLogListName: env.VITE_SP_CALL_LOG_LIST || '',
     hrSiteUrl,
     newHireListName: env.VITE_SP_NEW_HIRE_LIST || '',
     dischargedStaffSiteUrl: env.VITE_SP_DISCHARGED_STAFF_SITE_URL || env.VITE_SP_SITE_URL || '',
@@ -49,10 +51,22 @@ function readItemField(item, names) {
 
 // Choice/Lookup/Person fields all come back as an object in verbose OData; plain fields come back as-is.
 function readSharePointValue(value) {
+  if (Array.isArray(value)) {
+    return value.map(readSharePointValue).filter(Boolean).join('; ');
+  }
   if (value && typeof value === 'object') {
-    return value.Value || value.Label || value.Title || value.lookupValue || '';
+    if (Array.isArray(value.results)) return readSharePointValue(value.results);
+    return value.Value || value.Label || value.Title || value.LookupValue || value.lookupValue || '';
   }
   return value || '';
+}
+
+function readSharePointItemName(item) {
+  for (const field of ['Title', 'Name', 'LinkTitle2', 'LinkTitle']) {
+    const value = readSharePointValue(readItemField(item, [field]));
+    if (value) return String(value).trim();
+  }
+  return '';
 }
 
 // The Intake list has ~30 optional fields beyond the core ones loadIntakeClients/createIntakeClient
@@ -196,6 +210,11 @@ export class SharePointDataService {
    * 'Id' is always kept since it's a system field that may not appear in the fields list.
    */
   async getAvailableFields(siteUrl, listName, candidateFields) {
+    const fieldMap = await this.getAvailableFieldMap(siteUrl, listName, candidateFields);
+    return Array.from(new Set(candidateFields.map((field) => fieldMap[field]).filter(Boolean)));
+  }
+
+  async getAvailableFieldMap(siteUrl, listName, candidateFields) {
     const token = await this.getAccessToken();
     const fieldsUrl = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/fields?$select=InternalName,Title,Hidden&$top=5000`;
 
@@ -203,7 +222,7 @@ export class SharePointDataService {
       const response = await fetch(fieldsUrl, {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/json;odata=verbose' }
       });
-      if (!response.ok) return candidateFields;
+      if (!response.ok) return Object.fromEntries(candidateFields.map((field) => [field, field]));
 
       const payload = await response.json();
       const allFields = payload?.d?.results || [];
@@ -217,13 +236,22 @@ export class SharePointDataService {
       // Hidden only controls the default SharePoint form, not $select queryability - fields like
       // EndDate commonly come back hidden even when they hold real data, so match against every
       // field returned, not just the visible ones, or a real column silently drops from the query.
-      const names = new Set(allFields.map((field) => field.InternalName.toLowerCase()));
+      const fieldNames = new Map();
+      for (const field of allFields) {
+        fieldNames.set(field.InternalName.toLowerCase(), field.InternalName);
+        if (field.Title) fieldNames.set(field.Title.toLowerCase(), field.InternalName);
+      }
 
-      return candidateFields.filter(
-        (field) => field === 'Id' || names.has(field.split('/')[0].toLowerCase())
-      );
+      return Object.fromEntries(candidateFields.flatMap((field) => {
+        if (field === 'Id') return [[field, field]];
+        const [candidateName, ...nestedFields] = field.split('/');
+        const actualName = fieldNames.get(candidateName.toLowerCase());
+        return actualName
+          ? [[field, `${actualName}${nestedFields.length ? `/${nestedFields.join('/')}` : ''}`]]
+          : [];
+      }));
     } catch {
-      return candidateFields;
+      return Object.fromEntries(candidateFields.map((field) => [field, field]));
     }
   }
 
@@ -338,10 +366,13 @@ export class SharePointDataService {
       'StaffPerson/Id',
       'StaffPerson/Title',
       'StaffPerson/EMail',
+      'WorkEmail',
+      'EmailAddress',
       'Title',
       'Name',
       'Role',
       'Position',
+      'Status',
       'IsActive',
       'StartDate',
       'Start Date',
@@ -358,7 +389,8 @@ export class SharePointDataService {
       'Program'
     ];
     const select = await this.getAvailableFields(siteUrl, listName, candidateFields);
-    const expand = select.some((field) => field.startsWith('StaffPerson/')) ? 'StaffPerson' : undefined;
+    const staffPersonField = select.find((field) => field.toLowerCase().startsWith('staffperson/'));
+    const expand = staffPersonField ? staffPersonField.split('/')[0] : undefined;
     const items = await this.getListItems(siteUrl, listName, select, expand);
 
     return items.map((item) => {
@@ -387,9 +419,13 @@ export class SharePointDataService {
       return {
         id: person.Id || item.Id,
         sourceId: item.Id,
-        name: person.Title || readSharePointValue(readItemField(['Title', 'Name'])) || 'Unknown Staff',
-        email: person.EMail || '',
+        name: person.Title || readSharePointItemName(item) || 'Unknown Staff',
+        email: person.EMail ||
+          readSharePointValue(readItemField(['WorkEmail'])) ||
+          readSharePointValue(readItemField(['EmailAddress', 'Email'])) ||
+          '',
         role,
+        status: readSharePointValue(readItemField(['Status'])),
         startDate: normalizeSharePointDate(readSharePointValue(readItemField(['StartDate', 'Start Date', 'Start_x0020_Date'])) || null),
         endDate: transitionEndDate || normalizeSharePointDate(readSharePointValue(readItemField(['TermDate', 'Term Date', 'Term_x0020_Date'])) || null),
         newPosition,
@@ -413,8 +449,12 @@ export class SharePointDataService {
     const candidateFields = [
       'Id',
       'Title',
+      'Teacher/Id',
+      'Teacher/Title',
+      'Teacher/EMail',
       'UpdatedProgram',
       'Service',
+      'Services',
       'RatioAM',
       'IsActive',
       'IntakeStatus',
@@ -422,41 +462,56 @@ export class SharePointDataService {
       'StartDate',
       'EndDate'
     ];
-    const select = await this.getAvailableFields(
+    const fieldMap = await this.getAvailableFieldMap(
       siteUrl,
       listName,
       candidateFields
     );
-    const items = await this.getListItems(
-      siteUrl,
-      listName,
-      select
-    );
+    const select = Array.from(new Set(Object.values(fieldMap)));
+    const teacherField = fieldMap['Teacher/Title'] || fieldMap['Teacher/Id'];
+    const teacherFieldName = teacherField?.split('/')[0];
+    let items;
+    try {
+      items = await this.getListItems(
+        siteUrl,
+        listName,
+        select,
+        teacherField ? teacherFieldName : undefined
+      );
+    } catch (error) {
+      if (!teacherField) throw error;
+      console.warn('Current client query with teacher expansion failed, retrying without expansion:', error);
+      const flatSelect = Array.from(new Set(select.map((field) => field.split('/')[0])));
+      items = await this.getListItems(siteUrl, listName, flatSelect);
+    }
 
     return items
       .filter((item) => {
         // A client put back On Hold at the last minute never actually started, even if
         // a (now stale) Start Date is still on the record - keep them out of Current Clients.
-        const intakeStatus = item.IntakeStatus || item.Intake_x0020_Status || '';
+        const intakeStatus = readSharePointValue(readItemField(item, ['IntakeStatus', 'Intake_x0020_Status']));
         return String(intakeStatus).trim().toLowerCase() !== 'on hold';
       })
       .map((item) => {
-        const intakeStatus = item.IntakeStatus || item.Intake_x0020_Status || '';
+        const intakeStatus = readSharePointValue(readItemField(item, ['IntakeStatus', 'Intake_x0020_Status']));
         const isDiscontinued = String(intakeStatus).trim().toLowerCase() === 'discontinued';
-        const dischargeDate = normalizeSharePointDate(item.EndDate || null);
+        const teacher = readItemField(item, [teacherFieldName || 'Teacher']);
+        const dischargeDate = normalizeSharePointDate(readSharePointValue(readItemField(item, ['EndDate'])) || null);
         const hasDischarged = dischargeDate && new Date(dischargeDate) < new Date();
 
         return {
           id: item.Id,
           sourceId: item.Id,
-          Title: item.Title || `Client ${item.Id}`,
-          Program: item.UpdatedProgram || '',
-          Services: item.Service || '',
-          'Start Date': normalizeSharePointDate(item.StartDate),
+          Title: readSharePointItemName(item) || `Client ${item.Id}`,
+          Teacher: readSharePointValue(teacher),
+          TeacherEmail: teacher?.EMail || teacher?.Email || '',
+          Program: readSharePointValue(readItemField(item, [fieldMap.UpdatedProgram, fieldMap.Program, 'UpdatedProgram', 'Program'].filter(Boolean))),
+          Services: readSharePointValue(readItemField(item, [fieldMap.Service, fieldMap.Services, 'Service', 'Services'].filter(Boolean))),
+          'Start Date': normalizeSharePointDate(readSharePointValue(readItemField(item, ['StartDate']))),
           'Discharge Date': dischargeDate,
           'Intake Status': intakeStatus,
-          'Staffing Ratio': item.RatioAM || '1:1',
-          Status: forceInactive || item.IsActive === false || (isDiscontinued && hasDischarged) ? 'Inactive' : 'Active'
+          'Staffing Ratio': readSharePointValue(readItemField(item, ['RatioAM'])) || '1:1',
+          Status: forceInactive || readItemField(item, ['IsActive']) === false || (isDiscontinued && hasDischarged) ? 'Inactive' : 'Active'
         };
       });
   }
@@ -540,6 +595,56 @@ export class SharePointDataService {
         ...extended
       };
     });
+  }
+
+  async loadCallLog() {
+    if (!this.config.callLogSiteUrl || !this.config.callLogListName) return [];
+
+    const candidateFields = [
+      'Id',
+      'Title',
+      'IntakeClient/Id',
+      'IntakeClient/Title',
+      'ContactType',
+      'Comment',
+      'Created',
+      'Author/Title'
+    ];
+    const select = await this.getAvailableFields(this.config.callLogSiteUrl, this.config.callLogListName, candidateFields);
+    const expand = Array.from(new Set(
+      select.filter((field) => field.includes('/')).map((field) => field.split('/')[0])
+    )).join(',') || undefined;
+    const items = await this.getListItems(this.config.callLogSiteUrl, this.config.callLogListName, select, expand);
+
+    return items
+      .map((item) => ({
+        id: item.Id,
+        intakeClientId: item.IntakeClient?.Id || null,
+        contactType: readSharePointValue(item.ContactType),
+        comment: readSharePointValue(item.Comment),
+        createdAt: normalizeSharePointDate(item.Created),
+        author: item.Author?.Title || 'Unknown user'
+      }))
+      .filter((entry) => entry.intakeClientId !== null)
+      .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
+  }
+
+  async createCallLogEntry(intakeClientId, contactType, comment) {
+    const created = await this.createListItem(this.config.callLogSiteUrl, this.config.callLogListName, {
+      Title: 'Call log entry',
+      IntakeClientId: Number(intakeClientId),
+      ContactType: contactType,
+      Comment: comment
+    });
+
+    return {
+      id: created?.Id,
+      intakeClientId: Number(intakeClientId),
+      contactType,
+      comment,
+      createdAt: normalizeSharePointDate(created?.Created) || new Date().toISOString(),
+      author: created?.Author?.Title || 'You'
+    };
   }
 
   // Mirrors loadIntakeClients' field mapping in reverse, so a new record round-trips
@@ -698,7 +803,7 @@ export class SharePointDataService {
     // Authenticate once before firing the four list loads in parallel, so they share one session instead of racing.
     await this.getAccessToken();
 
-    const [staff, dischargedStaff, currentClients, dischargedClients, intakeClients, prospectiveStaff, capacityPlanning, intakeBoardColumns] = await Promise.all([
+    const [staff, dischargedStaff, currentClients, dischargedClients, intakeClients, prospectiveStaff, capacityPlanning, intakeBoardColumns, callLog] = await Promise.all([
       this.loadStaff(),
       this.loadDischargedStaff(),
       this.loadCurrentClients(),
@@ -706,7 +811,8 @@ export class SharePointDataService {
       this.loadIntakeClients(),
       this.loadProspectiveStaff(),
       this.loadCapacityPlanning(),
-      this.getChoiceFieldOptions(this.config.intakeSiteUrl, this.config.intakeListName, 'board_x0020_choice')
+      this.getChoiceFieldOptions(this.config.intakeSiteUrl, this.config.intakeListName, 'board_x0020_choice'),
+      this.loadCallLog()
     ]);
 
     return {
@@ -716,6 +822,7 @@ export class SharePointDataService {
       prospectiveStaff,
       capacityPlanning,
       intakeBoardColumns,
+      callLog,
       totalClients: currentClients.length + intakeClients.length,
       lastUpdatedAt: new Date().toISOString()
     };
