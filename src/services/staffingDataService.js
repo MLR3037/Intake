@@ -16,8 +16,6 @@ export function getSharePointConfig() {
     // Current clients typically live in EvokeSchedule2.0's own list (often a different list, sometimes a different site).
     currentClientsSiteUrl: env.VITE_SP_CURRENT_CLIENTS_SITE_URL || '',
     currentClientsListName: env.VITE_SP_CURRENT_CLIENTS_LIST || '',
-    dischargedClientsSiteUrl: env.VITE_SP_DISCHARGED_CLIENTS_SITE_URL || env.VITE_SP_CURRENT_CLIENTS_SITE_URL || '',
-    dischargedClientsListName: env.VITE_SP_DISCHARGED_CLIENTS_LIST || '',
     // Incoming/prospective clients live in this app's own intake list.
     intakeSiteUrl: env.VITE_SP_INTAKE_SITE_URL || '',
     intakeListName: env.VITE_SP_INTAKE_LIST || '',
@@ -62,7 +60,7 @@ function readSharePointValue(value) {
 }
 
 function readSharePointItemName(item) {
-  for (const field of ['Title', 'Name', 'LinkTitle2', 'LinkTitle']) {
+  for (const field of ['Title', 'Client', 'ClientName', 'Client Name', 'Name', 'LinkTitle2', 'LinkTitle']) {
     const value = readSharePointValue(readItemField(item, [field]));
     if (value) return String(value).trim();
   }
@@ -445,13 +443,20 @@ export class SharePointDataService {
     }
   }
 
-  async loadCurrentClients(listName = this.config.currentClientsListName, siteUrl = this.config.currentClientsSiteUrl, forceInactive = false) {
+  async loadCurrentClients(listName = this.config.currentClientsListName, siteUrl = this.config.currentClientsSiteUrl) {
     const candidateFields = [
       'Id',
       'Title',
       'Teacher/Id',
       'Teacher/Title',
       'Teacher/EMail',
+      'BCBA/Id',
+      'BCBA/Title',
+      'BCBA/EMail',
+      'MHProvider/Id',
+      'MHProvider/Title',
+      'MHProvider/EMail',
+      'Program',
       'UpdatedProgram',
       'Service',
       'Services',
@@ -468,19 +473,21 @@ export class SharePointDataService {
       candidateFields
     );
     const select = Array.from(new Set(Object.values(fieldMap)));
-    const teacherField = fieldMap['Teacher/Title'] || fieldMap['Teacher/Id'];
-    const teacherFieldName = teacherField?.split('/')[0];
+    const personFieldNames = Object.keys(fieldMap)
+      .filter((field) => /\/(Title|Id)$/i.test(field))
+      .map((field) => fieldMap[field].split('/')[0]);
+    const expand = Array.from(new Set(personFieldNames)).join(',') || undefined;
     let items;
     try {
       items = await this.getListItems(
         siteUrl,
         listName,
         select,
-        teacherField ? teacherFieldName : undefined
+        expand
       );
     } catch (error) {
-      if (!teacherField) throw error;
-      console.warn('Current client query with teacher expansion failed, retrying without expansion:', error);
+      if (!expand) throw error;
+      console.warn('Current client query with staff assignment expansion failed, retrying without expansion:', error);
       const flatSelect = Array.from(new Set(select.map((field) => field.split('/')[0])));
       items = await this.getListItems(siteUrl, listName, flatSelect);
     }
@@ -495,7 +502,12 @@ export class SharePointDataService {
       .map((item) => {
         const intakeStatus = readSharePointValue(readItemField(item, ['IntakeStatus', 'Intake_x0020_Status']));
         const isDiscontinued = String(intakeStatus).trim().toLowerCase() === 'discontinued';
-        const teacher = readItemField(item, [teacherFieldName || 'Teacher']);
+        const teacherFieldName = (fieldMap['Teacher/Title'] || fieldMap['Teacher/Id'] || 'Teacher').split('/')[0];
+        const bcbaFieldName = (fieldMap['BCBA/Title'] || fieldMap['BCBA/Id'] || 'BCBA').split('/')[0];
+        const mhProviderFieldName = (fieldMap['MHProvider/Title'] || fieldMap['MHProvider/Id'] || 'MHProvider').split('/')[0];
+        const teacher = readItemField(item, [teacherFieldName]);
+        const bcba = readItemField(item, [bcbaFieldName]);
+        const mhProvider = readItemField(item, [mhProviderFieldName]);
         const dischargeDate = normalizeSharePointDate(readSharePointValue(readItemField(item, ['EndDate'])) || null);
         const hasDischarged = dischargeDate && new Date(dischargeDate) < new Date();
 
@@ -505,34 +517,29 @@ export class SharePointDataService {
           Title: readSharePointItemName(item) || `Client ${item.Id}`,
           Teacher: readSharePointValue(teacher),
           TeacherEmail: teacher?.EMail || teacher?.Email || '',
+          BCBA: readSharePointValue(bcba),
+          BCBAEmail: bcba?.EMail || bcba?.Email || '',
+          MHProvider: readSharePointValue(mhProvider),
+          MHProviderEmail: mhProvider?.EMail || mhProvider?.Email || '',
           Program: readSharePointValue(readItemField(item, [fieldMap.UpdatedProgram, fieldMap.Program, 'UpdatedProgram', 'Program'].filter(Boolean))),
           Services: readSharePointValue(readItemField(item, [fieldMap.Service, fieldMap.Services, 'Service', 'Services'].filter(Boolean))),
           'Start Date': normalizeSharePointDate(readSharePointValue(readItemField(item, ['StartDate']))),
           'Discharge Date': dischargeDate,
           'Intake Status': intakeStatus,
           'Staffing Ratio': readSharePointValue(readItemField(item, ['RatioAM'])) || '1:1',
-          Status: forceInactive || readItemField(item, ['IsActive']) === false || (isDiscontinued && hasDischarged) ? 'Inactive' : 'Active'
+          Status: readItemField(item, ['IsActive']) === false || (isDiscontinued && hasDischarged) ? 'Inactive' : 'Active'
         };
       });
-  }
-
-  async loadDischargedClients() {
-    try {
-      return await this.loadCurrentClients(
-        this.config.dischargedClientsListName,
-        this.config.dischargedClientsSiteUrl,
-        true
-      );
-    } catch (error) {
-      console.warn(`Unable to load optional discharged client list '${this.config.dischargedClientsListName}':`, error);
-      return [];
-    }
   }
 
   async loadIntakeClients() {
     const coreFields = [
       'Id',
       'Title',
+      'Client',
+      'ClientName',
+      'Client Name',
+      'Name',
       'board_x0020_choice',
       'Services',
       'InquiryDate',
@@ -577,7 +584,7 @@ export class SharePointDataService {
 
       return {
         id: item.Id,
-        Title: item.Title || `Prospect ${item.Id}`,
+        Title: readSharePointItemName(item) || `Prospect ${item.Id}`,
         'Intake Status': item.board_x0020_choice || 'Initial Inquiry',
         // Unlike 'Intake Status' above, keep the raw (possibly blank) value so the Kanban board
         // can bucket un-set items into an "Unassigned" column instead of defaulting them away.
@@ -803,11 +810,10 @@ export class SharePointDataService {
     // Authenticate once before firing the four list loads in parallel, so they share one session instead of racing.
     await this.getAccessToken();
 
-    const [staff, dischargedStaff, currentClients, dischargedClients, intakeClients, prospectiveStaff, capacityPlanning, intakeBoardColumns, callLog] = await Promise.all([
+    const [staff, dischargedStaff, currentClients, intakeClients, prospectiveStaff, capacityPlanning, intakeBoardColumns, callLog] = await Promise.all([
       this.loadStaff(),
       this.loadDischargedStaff(),
       this.loadCurrentClients(),
-      this.loadDischargedClients(),
       this.loadIntakeClients(),
       this.loadProspectiveStaff(),
       this.loadCapacityPlanning(),
@@ -817,7 +823,7 @@ export class SharePointDataService {
 
     return {
       staffing: summarizeStaffing([...staff, ...dischargedStaff]),
-      currentClients: [...currentClients, ...dischargedClients],
+      currentClients,
       intakeClients,
       prospectiveStaff,
       capacityPlanning,

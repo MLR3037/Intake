@@ -294,6 +294,14 @@ function getNormalizedAssignments(value) {
     .filter(Boolean);
 }
 
+function getCaseloadPositionType(role) {
+  const normalizedRole = String(role || '').toLowerCase();
+  if (normalizedRole.includes('mental health clinician')) return 'Mental Health Clinician';
+  if (normalizedRole.includes('clinical supervisor')) return 'Clinical Supervisor';
+  if (normalizedRole.includes('teacher')) return 'Teacher';
+  return null;
+}
+
 export default function IntakeCapacityPlanner() {
   const [authToken, setAuthToken] = useState(null);
   const [intakeData, setIntakeData] = useState(MOCK_INTAKE_DATA);
@@ -308,6 +316,7 @@ export default function IntakeCapacityPlanner() {
   const [syncError, setSyncError] = useState('');
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [view, setView] = useState('dashboard');
+  const [caseloadPositionFilter, setCaseloadPositionFilter] = useState('All positions');
   const [projectionWeeks, setProjectionWeeks] = useState(8);
   const [historyWeeks, setHistoryWeeks] = useState(2);
   const [availabilityProjectionWeeks, setAvailabilityProjectionWeeks] = useState(0);
@@ -498,27 +507,41 @@ export default function IntakeCapacityPlanner() {
   const schoolServiceClients = currentClients.filter(
     (client) => hasSchoolServices(client.Services) && client.Status !== 'Inactive'
   );
-  const matchesTeacherAssignment = (client, teacher) => {
-    const assignedNames = getNormalizedAssignments(client.Teacher);
-    const teacherName = String(teacher.name || '').trim().toLowerCase();
-    const teacherEmail = String(teacher.email || '').trim().toLowerCase();
-    const assignedEmail = String(client.TeacherEmail || '').trim().toLowerCase();
-    return assignedNames.includes(teacherName) || Boolean(teacherEmail && assignedEmail && teacherEmail === assignedEmail);
+  const activeClients = currentClients.filter((client) => client.Status !== 'Inactive');
+  const matchesStaffAssignment = (client, person, assignmentKey) => {
+    const assignedNames = getNormalizedAssignments(client[assignmentKey]);
+    const personName = String(person.name || '').trim().toLowerCase();
+    const personEmail = String(person.email || '').trim().toLowerCase();
+    const assignedEmail = String(client[`${assignmentKey}Email`] || '').trim().toLowerCase();
+    return assignedNames.includes(personName) || Boolean(personEmail && assignedEmail && personEmail === assignedEmail);
   };
-  const teacherRows = alphabetizeNames(
+  const allCaseloadRows = alphabetizeNames(
     staffingSnapshot.staff
-      .filter((person) => person.isActive !== false && /teacher/i.test(String(person.role || '')))
+      .filter((person) => person.isActive !== false && getCaseloadPositionType(person.role))
       .map((person) => {
-        const caseload = schoolServiceClients.filter((client) => matchesTeacherAssignment(client, person));
+        const positionType = getCaseloadPositionType(person.role);
+        const assignmentKey = positionType === 'Teacher'
+          ? 'Teacher'
+          : positionType === 'Clinical Supervisor'
+            ? 'BCBA'
+            : 'MHProvider';
+        const clients = positionType === 'Teacher' ? schoolServiceClients : activeClients;
+        const caseload = clients.filter((client) => matchesStaffAssignment(client, person, assignmentKey));
         const title = String(person.role || '').trim();
         const normalizedTitle = title.toLowerCase();
         const isSpedTeacher = normalizedTitle.includes('sped') || normalizedTitle.includes('special education');
-        const maxCapacity = isSpedTeacher
-          ? normalizedTitle.includes('interim') ? 8 : 10
-          : null;
+        const maxCapacity = positionType === 'Clinical Supervisor'
+          ? 8
+          : positionType === 'Mental Health Clinician'
+            ? 26
+            : isSpedTeacher
+              ? normalizedTitle.includes('interim') ? 8 : 10
+              : null;
 
         return {
           ...person,
+          positionType,
+          assignmentKey,
           title,
           caseload,
           maxCapacity,
@@ -526,8 +549,12 @@ export default function IntakeCapacityPlanner() {
         };
       })
   );
+  const caseloadRows = caseloadPositionFilter === 'All positions'
+    ? allCaseloadRows
+    : allCaseloadRows.filter((person) => person.positionType === caseloadPositionFilter);
+  const teacherRows = allCaseloadRows.filter((person) => person.positionType === 'Teacher');
   const unassignedSchoolServiceClients = schoolServiceClients.filter(
-    (client) => !teacherRows.some((teacher) => matchesTeacherAssignment(client, teacher))
+    (client) => !teacherRows.some((teacher) => matchesStaffAssignment(client, teacher, 'Teacher'))
   );
   const hasSchoolServiceAssignments = schoolServiceClients.some(
     (client) => getNormalizedAssignments(client.Teacher).length > 0
@@ -1057,7 +1084,7 @@ export default function IntakeCapacityPlanner() {
                 <option value="details">Prospective Clients</option>
                 <option value="board">Intake Board</option>
                 <option value="currentClients">Current Clients</option>
-                <option value="teacherCaseload">Teacher Caseload &amp; Availability</option>
+                <option value="teacherCaseload">Caseload &amp; Availability</option>
                 <option value="staff">Staff</option>
                 <option value="availability">Availability Planning</option>
                 <option value="projections">Capacity Projections</option>
@@ -1493,39 +1520,54 @@ export default function IntakeCapacityPlanner() {
         {view === 'teacherCaseload' && (
           <div className="space-y-6">
             <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-              <div className="border-b border-slate-200 px-6 py-4">
-                <h2 className="text-xl font-bold text-slate-900">Teacher Caseload &amp; Availability</h2>
-                <p className="mt-1 text-sm text-slate-600">
-                  {schoolServiceClients.length} active School Services {schoolServiceClients.length === 1 ? 'client' : 'clients'} found. Clients are grouped by their assigned teacher. SPED teachers have a capacity of 10; interim SPED teachers have a capacity of 8.
-                </p>
+              <div className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 px-6 py-4">
+                <div>
+                  <h2 className="text-xl font-bold text-slate-900">Caseload &amp; Availability</h2>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Caseloads are grouped by staff assignment. Clinical Supervisors have a capacity of 8; Mental Health Clinicians have a capacity of 26.
+                  </p>
+                </div>
+                <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                  <span>Position type</span>
+                  <select
+                    value={caseloadPositionFilter}
+                    onChange={(event) => setCaseloadPositionFilter(event.target.value)}
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700"
+                  >
+                    <option>All positions</option>
+                    <option>Teacher</option>
+                    <option>Clinical Supervisor</option>
+                    <option>Mental Health Clinician</option>
+                  </select>
+                </label>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full">
                   <thead className="border-b border-slate-200 bg-slate-50">
                     <tr>
-                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Teacher</th>
-                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Title</th>
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Staff Member</th>
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700">Position Type</th>
                       <th className="px-6 py-3 text-right text-xs font-semibold text-slate-700">Caseload</th>
                       <th className="px-6 py-3 text-right text-xs font-semibold text-slate-700">Max Capacity</th>
                       <th className="px-6 py-3 text-right text-xs font-semibold text-slate-700">Available</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200">
-                    {teacherRows.map((teacher) => (
-                      <tr key={teacher.id} className="hover:bg-slate-50">
-                        <td className="px-6 py-4 text-sm font-medium text-slate-900">{teacher.name}</td>
-                        <td className="px-6 py-4 text-sm text-slate-600">{teacher.title}</td>
-                        <td className="px-6 py-4 text-right text-sm text-slate-600">{teacher.caseload.length}</td>
-                        <td className="px-6 py-4 text-right text-sm text-slate-600">{teacher.maxCapacity ?? 'N/A'}</td>
-                        <td className={`px-6 py-4 text-right text-sm font-semibold ${teacher.availableCapacity < 0 ? 'text-[#a84b2a]' : 'text-slate-700'}`}>
-                          {teacher.availableCapacity ?? 'N/A'}
+                    {caseloadRows.map((person) => (
+                      <tr key={`${person.positionType}-${person.id}`} className="hover:bg-slate-50">
+                        <td className="px-6 py-4 text-sm font-medium text-slate-900">{person.name}</td>
+                        <td className="px-6 py-4 text-sm text-slate-600">{person.positionType}</td>
+                        <td className="px-6 py-4 text-right text-sm text-slate-600">{person.caseload.length}</td>
+                        <td className="px-6 py-4 text-right text-sm text-slate-600">{person.maxCapacity ?? 'N/A'}</td>
+                        <td className={`px-6 py-4 text-right text-sm font-semibold ${person.availableCapacity < 0 ? 'text-[#a84b2a]' : 'text-slate-700'}`}>
+                          {person.availableCapacity ?? 'N/A'}
                         </td>
                       </tr>
                     ))}
-                    {teacherRows.length === 0 && (
+                    {caseloadRows.length === 0 && (
                       <tr>
                         <td colSpan="5" className="px-6 py-8 text-center text-sm text-slate-500">
-                          No active teachers found in the employee list.
+                          No active staff found for this position type.
                         </td>
                       </tr>
                     )}
@@ -1535,34 +1577,35 @@ export default function IntakeCapacityPlanner() {
             </section>
 
             <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-              {teacherRows.map((teacher) => (
-                <div key={`caseload-${teacher.id}`} className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+              {caseloadRows.map((person) => (
+                <div key={`caseload-${person.positionType}-${person.id}`} className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
                   <div className="mb-4 border-b border-slate-100 pb-3">
-                    <h3 className="font-bold text-slate-900">{teacher.name}</h3>
-                    <p className="text-sm text-slate-600">{teacher.title}</p>
+                    <h3 className="font-bold text-slate-900">{person.name}</h3>
+                    <p className="text-sm text-slate-600">{person.title}</p>
                   </div>
-                  {teacher.caseload.length > 0 ? (
+                  {person.caseload.length > 0 ? (
                     <ul className="space-y-2">
-                      {alphabetizeNames(teacher.caseload).map((client) => (
+                      {alphabetizeNames(person.caseload).map((client) => (
                         <li key={client.id} className="flex items-center justify-between gap-3 text-sm">
                           <span className="font-medium text-slate-800">{client.Title}</span>
-                          <span className="shrink-0 text-slate-500">{client.Program || 'School Services'}</span>
+                          <span className="shrink-0 text-slate-500">{client.Program || client.Services || 'N/A'}</span>
                         </li>
                       ))}
                     </ul>
                   ) : (
-                    <p className="text-sm text-slate-500">No active School Services clients assigned.</p>
+                    <p className="text-sm text-slate-500">No active clients assigned.</p>
                   )}
                   <p className="mt-4 border-t border-slate-100 pt-3 text-sm font-medium text-slate-700">
-                    {teacher.availableCapacity === null
-                      ? `${teacher.caseload.length} assigned`
-                      : `${teacher.availableCapacity} of ${teacher.maxCapacity} spots available`}
+                    {person.availableCapacity === null
+                      ? `${person.caseload.length} assigned`
+                      : `${person.availableCapacity} of ${person.maxCapacity} spots available`}
                   </p>
                 </div>
               ))}
             </section>
 
-            {unassignedSchoolServiceClients.length > 0 && (
+            {(caseloadPositionFilter === 'All positions' || caseloadPositionFilter === 'Teacher') &&
+              unassignedSchoolServiceClients.length > 0 && (
               <section className="rounded-lg border border-[#d9a441] bg-white p-5 shadow-sm">
                 <h3 className="font-bold text-slate-900">Unassigned School Services Clients</h3>
                 {!hasSchoolServiceAssignments && (
